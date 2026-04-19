@@ -43,13 +43,19 @@ func cmdTrainCUDA() {
 	cuda, ok := eng.(*mongoose.CUDA)
 	if !ok { log.Fatal("train-cuda requires CUDA") }
 
-	if mongoose.LoadKernels() {
-		log.Println("[tesseract] CUDA kernels loaded")
-	} else {
-		log.Fatal("CUDA kernels required — compile kernels/mongoose.cu")
-	}
-
+	kernelsAvail := mongoose.LoadKernels()
 	dim := *dimFlag
+	useGPUKernels := kernelsAvail && dim >= 512
+	if kernelsAvail {
+		if useGPUKernels {
+			log.Printf("[tesseract] CUDA kernels loaded — GPU kernels ACTIVE (dim=%d >= 512)", dim)
+		} else {
+			log.Printf("[tesseract] CUDA kernels loaded — cuBLAS path (dim=%d < 512, faster)", dim)
+		}
+	} else {
+		log.Println("[tesseract] CUDA kernels not found — cuBLAS only")
+	}
+	_ = useGPUKernels
 	heads := *headsFlag
 	kvHeads := *kvHeadsFlag
 	headDim := dim / heads
@@ -196,31 +202,63 @@ func cmdTrainCUDA() {
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
 	}
 
+	// L3 bridge for N+1 pipeline — CPU prepares next step while GPU runs current
+	l3Size := n * 4 * 2 // tokens + targets, double-buffered
+	l3 := cuda.AllocL3Bridge(l3Size)
+	var nextTokL3, nextTargL3 []float32
+	if l3 != nil {
+		nextTokL3 = l3.Float32(0, n)
+		nextTargL3 = l3.Float32(n*4, n)
+	}
+
+	// Pre-stage first batch
+	prepBatch := func(start int) {
+		if l3 == nil { return }
+		for i := 0; i < n; i++ {
+			nextTokL3[i] = math.Float32frombits(uint32(int32(data[start+i])))
+			nextTargL3[i] = math.Float32frombits(uint32(int32(data[start+i+1])))
+		}
+	}
+
+	// Prepare step 1 tokens
+	start0 := rng.Intn(len(data) - n - 1)
+	prepBatch(start0)
+
 	fmt.Println("Training...")
 	t0 := time.Now()
 
 	for step := 1; step <= *stepsFlag; step++ {
-		start := rng.Intn(len(data) - n - 1)
-		tokIDs := make([]int32, n)
-		targets := make([]int32, n)
-		for i := 0; i < n; i++ {
-			tokIDs[i] = int32(data[start+i])
-			targets[i] = int32(data[start+i+1])
+		// Current step uses tokens already in L3 (or uploaded)
+		if l3 != nil {
+			// Upload from L3 pinned memory — GPU reads from cache
+			tmpTok := te.FromHost(nextTokL3, []int{n})
+			cuda.CopyInto(tokGPU, tmpTok)
+			te.Release(tmpTok)
+			tmpTarg := te.FromHost(nextTargL3, []int{n})
+			cuda.CopyInto(targetsGPU, tmpTarg)
+			te.Release(tmpTarg)
+		} else {
+			start := rng.Intn(len(data) - n - 1)
+			tokF := make([]float32, n)
+			for i := 0; i < n; i++ { tokF[i] = math.Float32frombits(uint32(int32(data[start+i]))) }
+			tmpTok := te.FromHost(tokF, []int{n})
+			cuda.CopyInto(tokGPU, tmpTok)
+			te.Release(tmpTok)
+			targF := make([]float32, n)
+			for i := 0; i < n; i++ { targF[i] = math.Float32frombits(uint32(int32(data[start+i+1]))) }
+			tmpTarg := te.FromHost(targF, []int{n})
+			cuda.CopyInto(targetsGPU, tmpTarg)
+			te.Release(tmpTarg)
 		}
+
+		// N+1: start preparing next batch in goroutine while GPU runs
+		nextStart := rng.Intn(len(data) - n - 1)
+		go prepBatch(nextStart)
+
+		// Conductor tracks hot tokens from current step
+		tokIDs := make([]int32, n)
+		for i := 0; i < n; i++ { tokIDs[i] = int32(data[nextStart+i]) }
 		conductor.Observe(tokIDs)
-
-		// Upload tokens
-		tokF := make([]float32, n)
-		for i, t := range tokIDs { tokF[i] = math.Float32frombits(uint32(t)) }
-		tmpTok := te.FromHost(tokF, []int{n})
-		cuda.CopyInto(tokGPU, tmpTok)
-		te.Release(tmpTok)
-
-		targF := make([]float32, n)
-		for i, t := range targets { targF[i] = math.Float32frombits(uint32(t)) }
-		tmpTarg := te.FromHost(targF, []int{n})
-		cuda.CopyInto(targetsGPU, tmpTarg)
-		te.Release(tmpTarg)
 
 		// === FORWARD ===
 		zero(hidden)
@@ -355,7 +393,7 @@ func cmdTrainCUDA() {
 
 		adamW(embed, dEmbed, embedAS.m, embedAS.v, step)
 
-		if step%*logEvery == 0 || step == 1 {
+		if step <= 3 || step%*logEvery == 0 {
 			cuda.Sync()
 			lossH := te.ToHost(lossesGPU)
 			var totalLoss float32
