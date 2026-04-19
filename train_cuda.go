@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+	"unsafe"
 
 	"github.com/open-ai-org/mongoose"
 )
@@ -247,18 +248,10 @@ func cmdTrainCUDA() {
 			lc.normed = make([]float32, n*dim)
 			copy(lc.normed, buf)
 
-			// QKV — GPU matmul, input from L3 (buf), output to L3 (qBuf/kBuf/vBuf)
-			bufT := te.FromHost(buf, []int{n, dim})
-			Q := te.MatMulTransposeBT(bufT, gl.wq, n, dim, dim)
-			K := te.MatMulTransposeBT(bufT, gl.wk, n, dim, kvDim)
-			V := te.MatMulTransposeBT(bufT, gl.wv, n, dim, kvDim)
-			copy(qBuf, te.ToHost(Q))
-			copy(kBuf, te.ToHost(K))
-			copy(vBuf, te.ToHost(V))
-			te.Release(bufT)
-			te.Release(Q)
-			te.Release(K)
-			te.Release(V)
+			// QKV — cuBLAS reads buf from L3, writes q/k/v to L3. Zero upload.
+			cuda.MatMulL3(gl.wq, unsafe.Pointer(&buf[0]), unsafe.Pointer(&qBuf[0]), n, dim, dim)
+			cuda.MatMulL3(gl.wk, unsafe.Pointer(&buf[0]), unsafe.Pointer(&kBuf[0]), n, dim, kvDim)
+			cuda.MatMulL3(gl.wv, unsafe.Pointer(&buf[0]), unsafe.Pointer(&vBuf[0]), n, dim, kvDim)
 
 			// RoPE — CPU on L3
 			for pos := 0; pos < n; pos++ {
@@ -293,17 +286,13 @@ func cmdTrainCUDA() {
 				}
 			}
 
-			// O projection — GPU matmul
-			aT := te.FromHost(attnOut[:n*dim], []int{n, dim})
-			proj := te.MatMulTransposeBT(aT, gl.wo, n, dim, dim)
-			projH := te.ToHost(proj)
-			te.Release(aT)
-			te.Release(proj)
+			// O projection — cuBLAS reads attnOut from L3, writes to buf (L3)
+			cuda.MatMulL3(gl.wo, unsafe.Pointer(&attnOut[0]), unsafe.Pointer(&buf[0]), n, dim, dim)
 
 			// Residual — CPU on L3
 			copy(hidden, lc.xIn)
 			for i := 0; i < n*dim; i++ {
-				hidden[i] += projH[i]
+				hidden[i] += buf[i]
 			}
 
 			// RMSNorm2 — CPU on L3
@@ -312,31 +301,21 @@ func cmdTrainCUDA() {
 				rmsNormInPlace(buf[pos*dim:(pos+1)*dim], gl.norm2W)
 			}
 
-			// FFN — GPU matmuls
-			bufT2 := te.FromHost(buf[:n*dim], []int{n, dim})
-			G := te.MatMulTransposeBT(bufT2, gl.gate, n, dim, ffnDim)
-			U := te.MatMulTransposeBT(bufT2, gl.up, n, dim, ffnDim)
-			copy(ffnGBuf, te.ToHost(G))
-			copy(ffnUBuf, te.ToHost(U))
-			te.Release(bufT2)
-			te.Release(G)
-			te.Release(U)
+			// FFN — cuBLAS reads buf from L3, writes gate/up to L3
+			cuda.MatMulL3(gl.gate, unsafe.Pointer(&buf[0]), unsafe.Pointer(&ffnGBuf[0]), n, dim, ffnDim)
+			cuda.MatMulL3(gl.up, unsafe.Pointer(&buf[0]), unsafe.Pointer(&ffnUBuf[0]), n, dim, ffnDim)
 
 			// SiLU gate — CPU on L3
 			for i := 0; i < n*ffnDim; i++ {
 				ffnGBuf[i] = silu(ffnGBuf[i]) * ffnUBuf[i]
 			}
 
-			// Down projection — GPU matmul
-			ffnT := te.FromHost(ffnGBuf[:n*ffnDim], []int{n, ffnDim})
-			D := te.MatMulTransposeBT(ffnT, gl.down, n, ffnDim, dim)
-			downH := te.ToHost(D)
-			te.Release(ffnT)
-			te.Release(D)
+			// Down projection — cuBLAS reads ffnGBuf from L3, writes to buf (L3)
+			cuda.MatMulL3(gl.down, unsafe.Pointer(&ffnGBuf[0]), unsafe.Pointer(&buf[0]), n, ffnDim, dim)
 
 			// Residual — CPU on L3
 			for i := 0; i < n*dim; i++ {
-				hidden[i] += downH[i]
+				hidden[i] += buf[i]
 			}
 		}
 
@@ -345,12 +324,8 @@ func cmdTrainCUDA() {
 			rmsNormInPlace(hidden[pos*dim:(pos+1)*dim], finalNormW)
 		}
 
-		// LM head (tied embeddings) — GPU matmul
-		hT := te.FromHost(hidden[:n*dim], []int{n, dim})
-		logitsT := te.MatMulTransposeBT(hT, embedT, n, dim, vocabSize)
-		copy(logitsBuf, te.ToHost(logitsT))
-		te.Release(hT)
-		te.Release(logitsT)
+		// LM head (tied embeddings) — cuBLAS reads hidden from L3
+		cuda.MatMulL3(embedT, unsafe.Pointer(&hidden[0]), unsafe.Pointer(&logitsBuf[0]), n, dim, vocabSize)
 
 		// === LOSS + BACKWARD (embedding gradient only for baseline) ===
 
