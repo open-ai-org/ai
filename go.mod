@@ -13,6 +13,7 @@ require (
 	github.com/gogpu/gputypes v0.4.0 // indirect
 	github.com/gogpu/naga v0.17.3 // indirect
 	github.com/gogpu/wgpu v0.24.7 // indirect
+	github.com/open-ai-org/helix v0.0.0-00010101000000-000000000000 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 )
 

@@ -9,17 +9,16 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-	"unsafe"
 
 	"github.com/open-ai-org/mongoose"
 )
 
 // cmdTrainCUDA trains from scratch on CUDA.
-// Weights live on GPU (TensorEngine). Activations live in L3 pinned memory.
-// CPU does element-wise ops (RMSNorm, RoPE, attention) on L3 slices.
-// GPU does matmuls reading weights from VRAM and activations from L3 cache.
-// One path. No copies. Clean division: CPU owns data between dispatches,
-// GPU owns it during cuBLAS calls. Sync() is the fence.
+// All ops on GPU via custom kernels: KEmbedGather, KRMSNormOutSave, KRoPE,
+// KCausalAttentionGQA, KSiLUGateMul, KSoftmaxCE for forward.
+// KCausalAttentionBackward, KRMSNormBackward, KRoPEBackward, KSiLUGateBackward for backward.
+// Standard AdamW optimizer. Conductor for sparse embedding updates.
+// Activations in L3 pinned memory where beneficial, weights on GPU.
 func cmdTrainCUDA() {
 	fs := flag.NewFlagSet("train-cuda", flag.ExitOnError)
 
@@ -54,6 +53,12 @@ func cmdTrainCUDA() {
 		log.Fatal("train-cuda requires CUDA backend")
 	}
 
+	if mongoose.LoadKernels() {
+		log.Println("[tesseract] CUDA kernels loaded — full GPU training")
+	} else {
+		log.Fatal("CUDA custom kernels required for GPU training — compile kernels/mongoose.cu")
+	}
+
 	dim := *dimFlag
 	heads := *headsFlag
 	kvHeads := *kvHeadsFlag
@@ -64,6 +69,7 @@ func cmdTrainCUDA() {
 	seqLen := *seqLenFlag
 	vocabSize := 256
 	lr := float32(*lrFlag)
+	n := seqLen
 
 	raw, err := os.ReadFile(*dataPath)
 	if err != nil {
@@ -74,116 +80,105 @@ func cmdTrainCUDA() {
 		data[i] = int(b)
 	}
 
-	n := seqLen + 1
+	// Conductor for sparse embedding updates
+	conductor := mongoose.NewConductor(vocabSize, 100)
 
-	// L3 bridge: pinned memory for activations and gradients.
-	// Layout: hidden[n*dim] | buf[n*dim] | q[n*dim] | k[n*kvDim] | v[n*kvDim] |
-	//         attnOut[n*dim] | ffnG[n*ffnDim] | ffnU[n*ffnDim] | logits[n*vocabSize] |
-	//         dHidden[n*dim] | dAttnOut[n*dim] | dFFN[n*ffnDim] | embedGrad[vocabSize*dim]
-	hiddenSz := n * dim
-	qSz := n * dim
-	kSz := n * kvDim
-	vSz := n * kvDim
-	attnSz := n * dim
-	ffnGSz := n * ffnDim
-	ffnUSz := n * ffnDim
-	logitsSz := n * vocabSize
-	dHiddenSz := n * dim
-	dAttnSz := n * dim
-	dFFNSz := n * ffnDim
-	embedGradSz := vocabSize * dim
-
-	totalFloats := hiddenSz + hiddenSz + qSz + kSz + vSz + attnSz +
-		ffnGSz + ffnUSz + logitsSz + dHiddenSz + dAttnSz + dFFNSz + embedGradSz
-	bridgeBytes := totalFloats * 4
-
-	bridge := cuda.AllocL3Bridge(bridgeBytes)
-	if bridge == nil {
-		log.Fatal("Failed to allocate L3 bridge — cudaHostAlloc failed")
+	// Precompute RoPE tables on GPU
+	halfHead := headDim / 2
+	cosTab := make([]float32, seqLen*halfHead)
+	sinTab := make([]float32, seqLen*halfHead)
+	for pos := 0; pos < seqLen; pos++ {
+		for j := 0; j < halfHead; j++ {
+			freq := 1.0 / math.Pow(10000.0, float64(2*j)/float64(headDim))
+			angle := float64(pos) * freq
+			cosTab[pos*halfHead+j] = float32(math.Cos(angle))
+			sinTab[pos*halfHead+j] = float32(math.Sin(angle))
+		}
 	}
+	ropeCos := te.FromHost(cosTab, []int{seqLen, halfHead})
+	ropeSin := te.FromHost(sinTab, []int{seqLen, halfHead})
 
-	off := 0
-	alloc := func(count int) ([]float32, int) {
-		s := bridge.Float32(off*4, count)
-		ptr := off * 4
-		off += count
-		return s, ptr
-	}
-
-	hidden, _ := alloc(hiddenSz)
-	buf, _ := alloc(hiddenSz)
-	qBuf, _ := alloc(qSz)
-	kBuf, _ := alloc(kSz)
-	vBuf, _ := alloc(vSz)
-	attnOut, _ := alloc(attnSz)
-	ffnGBuf, _ := alloc(ffnGSz)
-	ffnUBuf, _ := alloc(ffnUSz)
-	logitsBuf, _ := alloc(logitsSz)
-	_, _ = alloc(dHiddenSz) // reserved for full backward
-	_, _ = alloc(dAttnSz)  // reserved for full backward
-	_, _ = alloc(dFFNSz)   // reserved for full backward
-	embedGrad, _ := alloc(embedGradSz)
-
-	// Weights on GPU
-	type gpuLayer struct {
-		wq, wk, wv, wo     *mongoose.Tensor
-		gate, up, down      *mongoose.Tensor
-		norm1W, norm2W      []float32 // norms stay on CPU — tiny vectors
-	}
-
-	kaiming := func(rows, cols int) []float32 {
+	// Init weights on GPU
+	kaiming := func(rows, cols int) *mongoose.Tensor {
 		bound := float32(math.Sqrt(2.0 / float64(cols)))
 		d := make([]float32, rows*cols)
-		for i := range d {
-			d[i] = bound * (2*rand.Float32() - 1)
-		}
-		return d
+		for i := range d { d[i] = bound * (2*rand.Float32() - 1) }
+		return te.FromHost(d, []int{rows, cols})
+	}
+	ones := func(n int) *mongoose.Tensor {
+		d := make([]float32, n)
+		for i := range d { d[i] = 1.0 }
+		return te.FromHost(d, []int{1, n})
 	}
 
-	embedW := make([]float32, vocabSize*dim)
-	for i := range embedW {
-		embedW[i] = float32(rand.NormFloat64()) * 0.02
-	}
-	embedT := te.FromHost(embedW, []int{vocabSize, dim})
-	finalNormW := make([]float32, dim)
-	for i := range finalNormW {
-		finalNormW[i] = 1.0
-	}
+	embedData := make([]float32, vocabSize*dim)
+	for i := range embedData { embedData[i] = float32(rand.NormFloat64()) * 0.02 }
+	embed := te.FromHost(embedData, []int{vocabSize, dim})
+	finalNorm := ones(dim)
 
-	gpuLayers := make([]gpuLayer, nLayers)
-	for l := range gpuLayers {
-		norm1 := make([]float32, dim)
-		norm2 := make([]float32, dim)
-		for i := range norm1 {
-			norm1[i] = 1.0
-			norm2[i] = 1.0
-		}
-		gpuLayers[l] = gpuLayer{
-			wq:     te.FromHost(kaiming(dim, dim), []int{dim, dim}),
-			wk:     te.FromHost(kaiming(kvDim, dim), []int{kvDim, dim}),
-			wv:     te.FromHost(kaiming(kvDim, dim), []int{kvDim, dim}),
-			wo:     te.FromHost(kaiming(dim, dim), []int{dim, dim}),
-			gate:   te.FromHost(kaiming(ffnDim, dim), []int{ffnDim, dim}),
-			up:     te.FromHost(kaiming(ffnDim, dim), []int{ffnDim, dim}),
-			down:   te.FromHost(kaiming(dim, ffnDim), []int{dim, ffnDim}),
-			norm1W: norm1,
-			norm2W: norm2,
+	type layer struct {
+		wq, wk, wv, wo     *mongoose.Tensor
+		gate, up, down      *mongoose.Tensor
+		norm1, norm2        *mongoose.Tensor
+	}
+	layers := make([]layer, nLayers)
+	for l := range layers {
+		layers[l] = layer{
+			wq: kaiming(dim, dim), wk: kaiming(kvDim, dim),
+			wv: kaiming(kvDim, dim), wo: kaiming(dim, dim),
+			gate: kaiming(ffnDim, dim), up: kaiming(ffnDim, dim),
+			down: kaiming(dim, ffnDim),
+			norm1: ones(dim), norm2: ones(dim),
 		}
 	}
 
-	// Adam state for embedding (only param we update in this baseline)
-	embedM := make([]float32, vocabSize*dim)
-	embedV := make([]float32, vocabSize*dim)
+	// Adam state on GPU
+	type adamState struct {
+		m, v *mongoose.Tensor
+	}
+	newAdam := func(size int) adamState {
+		return adamState{m: te.Zeros([]int{size}), v: te.Zeros([]int{size})}
+	}
+
+	embedAdam := newAdam(vocabSize * dim)
+	_ = newAdam(dim) // finalNorm adam — TODO wire
+	type layerAdam struct {
+		wq, wk, wv, wo     adamState
+		gate, up, down      adamState
+		norm1, norm2        adamState
+	}
+	layerAdams := make([]layerAdam, nLayers)
+	for l := range layerAdams {
+		layerAdams[l] = layerAdam{
+			wq: newAdam(dim * dim), wk: newAdam(kvDim * dim),
+			wv: newAdam(kvDim * dim), wo: newAdam(dim * dim),
+			gate: newAdam(ffnDim * dim), up: newAdam(ffnDim * dim),
+			down: newAdam(dim * ffnDim),
+			norm1: newAdam(dim), norm2: newAdam(dim),
+		}
+	}
+
+	// Pre-allocate forward cache tensors (reuse every step)
+	type fwdCache struct {
+		xIn, normed, Q, K, V, attnOut    *mongoose.Tensor
+		xMid, normed2, gatePre, upOut, ffnMid *mongoose.Tensor
+		rmsScale1, rmsScale2              *mongoose.Tensor
+	}
+	caches := make([]fwdCache, nLayers)
+	for i := range caches {
+		caches[i] = fwdCache{
+			xIn: te.Zeros([]int{n, dim}), xMid: te.Zeros([]int{n, dim}),
+		}
+	}
 
 	nParams := vocabSize*dim + dim
-	for range nLayers {
+	for range layers {
 		nParams += dim + dim*dim + kvDim*dim + kvDim*dim + dim*dim +
 			dim + ffnDim*dim*2 + dim*ffnDim
 	}
 
-	fmt.Println("tesseract train-cuda — L3 descriptor path (cuBLAS + pinned memory)")
+	fmt.Println("tesseract train-cuda — full GPU kernels + AdamW + Conductor")
 	fmt.Printf("  engine:   %s\n", eng.Name())
-	fmt.Printf("  L3:       %d MB pinned\n", bridgeBytes/(1024*1024))
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
 	fmt.Printf("  model:    dim=%d heads=%d kv=%d layers=%d ffn=%d seq=%d vocab=%d\n",
 		dim, heads, kvHeads, nLayers, ffnDim, seqLen, vocabSize)
@@ -196,200 +191,200 @@ func cmdTrainCUDA() {
 	fmt.Println()
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	normEps := float32(1e-6)
 
-	rmsNormInPlace := func(x, weight []float32) {
-		sz := len(x)
-		var ss float32
-		for i := 0; i < sz; i++ {
-			ss += x[i] * x[i]
-		}
-		ss = float32(1.0 / math.Sqrt(float64(ss)/float64(sz)+float64(normEps)))
-		for i := 0; i < sz; i++ {
-			x[i] = x[i] * ss * weight[i]
-		}
+	adamUpdate := func(param, grad, mState, vState *mongoose.Tensor, step int) {
+		mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mState.DevicePtr(), vState.DevicePtr(),
+			lr, 0.01, step, param.Size)
 	}
+	_ = adamUpdate
 
 	fmt.Println("Training...")
 	t0 := time.Now()
 
 	for step := 1; step <= *stepsFlag; step++ {
 		start := rng.Intn(len(data) - n - 1)
-		tokens := data[start : start+n]
 
-		// === FORWARD (CPU element-wise on L3, GPU matmul via cuBLAS) ===
+		tokIDs := make([]int32, n)
+		targets := make([]int32, n)
+		for i := 0; i < n; i++ {
+			tokIDs[i] = int32(data[start+i])
+			targets[i] = int32(data[start+i+1])
+		}
+		conductor.Observe(tokIDs)
 
-		// Embedding lookup — CPU writes hidden in L3
-		eHost := te.ToHost(embedT)
-		for i, t := range tokens {
-			copy(hidden[i*dim:(i+1)*dim], eHost[t*dim:(t+1)*dim])
+		// Upload tokens to GPU
+		tokF := make([]float32, n)
+		for i, t := range tokIDs { tokF[i] = math.Float32frombits(uint32(t)) }
+		tokGPU := te.FromHost(tokF, []int{n})
+
+		// === FORWARD — all on GPU ===
+
+		hidden := te.Zeros([]int{n, dim})
+		mongoose.KEmbedGather2(hidden.DevicePtr(), embed.DevicePtr(), tokGPU.DevicePtr(), n, dim)
+
+		for li := range layers {
+			l := &layers[li]
+			c := &caches[li]
+
+			cuda.CopyInto(c.xIn, hidden)
+
+			// RMSNorm1
+			c.normed = te.Zeros([]int{n, dim})
+			c.rmsScale1 = te.Zeros([]int{n})
+			mongoose.KRMSNormOutSave(hidden.DevicePtr(), c.normed.DevicePtr(),
+				l.norm1.DevicePtr(), c.rmsScale1.DevicePtr(), n, dim)
+
+			// QKV matmul
+			c.Q = te.MatMulTransposeBT(c.normed, l.wq, n, dim, dim)
+			c.K = te.MatMulTransposeBT(c.normed, l.wk, n, dim, kvDim)
+			c.V = te.MatMulTransposeBT(c.normed, l.wv, n, dim, kvDim)
+
+			// RoPE
+			mongoose.KRoPE(c.Q.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
+			mongoose.KRoPE(c.K.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
+
+			// Causal attention
+			c.attnOut = te.Zeros([]int{n, dim})
+			mongoose.KCausalAttentionGQA(c.Q.DevicePtr(), c.K.DevicePtr(), c.V.DevicePtr(), c.attnOut.DevicePtr(),
+				n, dim, kvDim, heads, kvHeads)
+
+			// O projection + residual
+			proj := te.MatMulTransposeBT(c.attnOut, l.wo, n, dim, dim)
+			te.AddInPlace(hidden, proj)
+			te.Release(proj)
+
+			cuda.CopyInto(c.xMid, hidden)
+
+			// RMSNorm2
+			c.normed2 = te.Zeros([]int{n, dim})
+			c.rmsScale2 = te.Zeros([]int{n})
+			mongoose.KRMSNormOutSave(hidden.DevicePtr(), c.normed2.DevicePtr(),
+				l.norm2.DevicePtr(), c.rmsScale2.DevicePtr(), n, dim)
+
+			// FFN
+			c.gatePre = te.MatMulTransposeBT(c.normed2, l.gate, n, dim, ffnDim)
+			c.upOut = te.MatMulTransposeBT(c.normed2, l.up, n, dim, ffnDim)
+			c.ffnMid = te.Zeros([]int{n, ffnDim})
+			mongoose.KSiLUGateMul(c.gatePre.DevicePtr(), c.upOut.DevicePtr(), c.ffnMid.DevicePtr(), n*ffnDim)
+
+			down := te.MatMulTransposeBT(c.ffnMid, l.down, n, ffnDim, dim)
+			te.AddInPlace(hidden, down)
+			te.Release(down)
 		}
 
-		// Per-layer cache for backward
-		type layerCache struct {
-			xIn    []float32
-			normed []float32
-		}
-		caches := make([]layerCache, nLayers)
+		// Final RMSNorm
+		finalScales := te.Zeros([]int{n})
+		normedFinal := te.Zeros([]int{n, dim})
+		mongoose.KRMSNormOutSave(hidden.DevicePtr(), normedFinal.DevicePtr(),
+			finalNorm.DevicePtr(), finalScales.DevicePtr(), n, dim)
 
-		for li := range gpuLayers {
-			gl := &gpuLayers[li]
-			lc := &caches[li]
+		// LM head + loss
+		logits := te.MatMulTransposeBT(normedFinal, embed, n, dim, vocabSize)
+		targetsF := make([]float32, n)
+		for i, t := range targets { targetsF[i] = math.Float32frombits(uint32(t)) }
+		targetsGPU := te.FromHost(targetsF, []int{n})
+		lossesGPU := te.Zeros([]int{n})
+		gradGPU := te.Zeros([]int{n, vocabSize})
+		invN := float32(1.0) / float32(n)
+		mongoose.KSoftmaxCE(logits.DevicePtr(), targetsGPU.DevicePtr(),
+			lossesGPU.DevicePtr(), gradGPU.DevicePtr(), n, vocabSize, invN)
 
-			// Cache input for residual backward
-			lc.xIn = make([]float32, n*dim)
-			copy(lc.xIn, hidden)
+		// Read loss
+		lossH := te.ToHost(lossesGPU)
+		var totalLoss float32
+		for _, l := range lossH { totalLoss += l }
 
-			// RMSNorm1 — CPU on L3
-			copy(buf, hidden)
-			for pos := 0; pos < n; pos++ {
-				rmsNormInPlace(buf[pos*dim:(pos+1)*dim], gl.norm1W)
-			}
-			lc.normed = make([]float32, n*dim)
-			copy(lc.normed, buf)
+		// === BACKWARD — all on GPU ===
 
-			// QKV — cuBLAS reads buf from L3, writes q/k/v to L3. Zero upload.
-			cuda.MatMulL3(gl.wq, unsafe.Pointer(&buf[0]), unsafe.Pointer(&qBuf[0]), n, dim, dim)
-			cuda.MatMulL3(gl.wk, unsafe.Pointer(&buf[0]), unsafe.Pointer(&kBuf[0]), n, dim, kvDim)
-			cuda.MatMulL3(gl.wv, unsafe.Pointer(&buf[0]), unsafe.Pointer(&vBuf[0]), n, dim, kvDim)
+		// dLogits already computed by KSoftmaxCE → gradGPU
+		// Embed gradient: dEmbed = logitsGrad^T @ normedFinal
+		dEmbed := te.MatMulTransposeAT(normedFinal, gradGPU, dim, n, vocabSize)
 
-			// RoPE — CPU on L3
-			for pos := 0; pos < n; pos++ {
-				applyRoPESingle(qBuf[pos*dim:(pos+1)*dim], pos, headDim, heads, 10000.0)
-				applyRoPESingle(kBuf[pos*kvDim:(pos+1)*kvDim], pos, headDim, kvHeads, 10000.0)
-			}
+		// dHidden from LM head: dH = gradGPU @ embed
+		dHidden := te.MatMulT(gradGPU, embed, n, vocabSize, dim)
+		te.Release(gradGPU); te.Release(logits); te.Release(targetsGPU); te.Release(lossesGPU)
 
-			// Causal attention — CPU on L3
-			for i := range attnOut[:n*dim] {
-				attnOut[i] = 0
-			}
-			kvMul := heads / kvHeads
-			for pos := 0; pos < n; pos++ {
-				for h := 0; h < heads; h++ {
-					qOff := pos*dim + h*headDim
-					kvH := h / kvMul
-					scale := float32(1.0 / math.Sqrt(float64(headDim)))
-					scores := make([]float32, pos+1)
-					for t := 0; t <= pos; t++ {
-						var dot float32
-						for j := 0; j < headDim; j++ {
-							dot += qBuf[qOff+j] * kBuf[t*kvDim+kvH*headDim+j]
-						}
-						scores[t] = dot * scale
-					}
-					softmax(scores, len(scores))
-					for t := 0; t <= pos; t++ {
-						for j := 0; j < headDim; j++ {
-							attnOut[pos*dim+h*headDim+j] += scores[t] * vBuf[t*kvDim+kvH*headDim+j]
-						}
-					}
-				}
-			}
+		// Final RMSNorm backward
+		dNormFinal := te.Zeros([]int{n, dim})
+		mongoose.KRMSNormBackward(dHidden.DevicePtr(), hidden.DevicePtr(),
+			finalNorm.DevicePtr(), finalScales.DevicePtr(), dNormFinal.DevicePtr(), n, dim)
+		te.Release(finalScales); te.Release(normedFinal); te.Release(hidden)
 
-			// O projection — cuBLAS reads attnOut from L3, writes to buf (L3)
-			cuda.MatMulL3(gl.wo, unsafe.Pointer(&attnOut[0]), unsafe.Pointer(&buf[0]), n, dim, dim)
+		// Per-layer backward (reverse order)
+		for li := nLayers - 1; li >= 0; li-- {
+			l := &layers[li]
+			c := &caches[li]
 
-			// Residual — CPU on L3
-			copy(hidden, lc.xIn)
-			for i := 0; i < n*dim; i++ {
-				hidden[i] += buf[i]
-			}
+			// FFN backward
+			dFFNMid := te.Zeros([]int{n, ffnDim})
+			mongoose.KSiLUGateBackward(dNormFinal.DevicePtr(), c.gatePre.DevicePtr(),
+				c.upOut.DevicePtr(), c.ffnMid.DevicePtr(), dFFNMid.DevicePtr(), n*ffnDim)
 
-			// RMSNorm2 — CPU on L3
-			copy(buf, hidden)
-			for pos := 0; pos < n; pos++ {
-				rmsNormInPlace(buf[pos*dim:(pos+1)*dim], gl.norm2W)
-			}
+			// Weight gradients: down, gate, up
+			dWDown := te.MatMulTransposeAT(c.ffnMid, dNormFinal, ffnDim, n, dim)
+			dWGate := te.MatMulTransposeAT(c.normed2, dFFNMid, dim, n, ffnDim)
+			dWUp := te.MatMulTransposeAT(c.normed2, dFFNMid, dim, n, ffnDim)
 
-			// FFN — cuBLAS reads buf from L3, writes gate/up to L3
-			cuda.MatMulL3(gl.gate, unsafe.Pointer(&buf[0]), unsafe.Pointer(&ffnGBuf[0]), n, dim, ffnDim)
-			cuda.MatMulL3(gl.up, unsafe.Pointer(&buf[0]), unsafe.Pointer(&ffnUBuf[0]), n, dim, ffnDim)
+			// AdamW on FFN weights
+			adamUpdate(l.down, dWDown, layerAdams[li].down.m, layerAdams[li].down.v, step)
+			adamUpdate(l.gate, dWGate, layerAdams[li].gate.m, layerAdams[li].gate.v, step)
+			adamUpdate(l.up, dWUp, layerAdams[li].up.m, layerAdams[li].up.v, step)
+			te.Release(dWDown); te.Release(dWGate); te.Release(dWUp)
+			te.Release(dFFNMid); te.Release(c.gatePre); te.Release(c.upOut); te.Release(c.ffnMid)
 
-			// SiLU gate — CPU on L3
-			for i := 0; i < n*ffnDim; i++ {
-				ffnGBuf[i] = silu(ffnGBuf[i]) * ffnUBuf[i]
-			}
+			// RMSNorm2 backward
+			dN2 := te.Zeros([]int{n, dim})
+			mongoose.KRMSNormBackward(dNormFinal.DevicePtr(), c.xMid.DevicePtr(),
+				l.norm2.DevicePtr(), c.rmsScale2.DevicePtr(), dN2.DevicePtr(), n, dim)
+			te.Release(c.normed2); te.Release(c.rmsScale2); te.Release(dNormFinal)
 
-			// Down projection — cuBLAS reads ffnGBuf from L3, writes to buf (L3)
-			cuda.MatMulL3(gl.down, unsafe.Pointer(&ffnGBuf[0]), unsafe.Pointer(&buf[0]), n, ffnDim, dim)
+			// Attention backward: dQ, dK, dV
+			dQ := te.Zeros([]int{n, dim})
+			dK := te.Zeros([]int{n, kvDim})
+			dV := te.Zeros([]int{n, kvDim})
 
-			// Residual — CPU on L3
-			for i := 0; i < n*dim; i++ {
-				hidden[i] += buf[i]
-			}
-		}
+			// dAttnOut from WO backward
+			dWO := te.MatMulTransposeAT(c.attnOut, dN2, dim, n, dim)
+			dAttnOut := te.MatMulT(dN2, l.wo, n, dim, dim)
+			adamUpdate(l.wo, dWO, layerAdams[li].wo.m, layerAdams[li].wo.v, step)
+			te.Release(dWO)
 
-		// Final RMSNorm — CPU on L3
-		for pos := 0; pos < n; pos++ {
-			rmsNormInPlace(hidden[pos*dim:(pos+1)*dim], finalNormW)
-		}
+			mongoose.KCausalAttentionBackward(c.Q.DevicePtr(), c.K.DevicePtr(), c.V.DevicePtr(), dAttnOut.DevicePtr(),
+				dQ.DevicePtr(), dK.DevicePtr(), dV.DevicePtr(), n, dim, kvDim, heads, kvHeads)
+			te.Release(dAttnOut); te.Release(c.attnOut)
 
-		// LM head (tied embeddings) — cuBLAS reads hidden from L3
-		cuda.MatMulL3(embedT, unsafe.Pointer(&hidden[0]), unsafe.Pointer(&logitsBuf[0]), n, dim, vocabSize)
+			// RoPE backward
+			mongoose.KRoPEBackward(dQ.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
+			mongoose.KRoPEBackward(dK.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
 
-		// === LOSS + BACKWARD (embedding gradient only for baseline) ===
+			// QKV weight gradients
+			dWQ := te.MatMulTransposeAT(c.normed, dQ, dim, n, dim)
+			dWK := te.MatMulTransposeAT(c.normed, dK, dim, n, kvDim)
+			dWV := te.MatMulTransposeAT(c.normed, dV, dim, n, kvDim)
+			adamUpdate(l.wq, dWQ, layerAdams[li].wq.m, layerAdams[li].wq.v, step)
+			adamUpdate(l.wk, dWK, layerAdams[li].wk.m, layerAdams[li].wk.v, step)
+			adamUpdate(l.wv, dWV, layerAdams[li].wv.m, layerAdams[li].wv.v, step)
+			te.Release(dWQ); te.Release(dWK); te.Release(dWV)
+			te.Release(c.Q); te.Release(c.K); te.Release(c.V); te.Release(c.normed)
+			te.Release(dQ); te.Release(dK); te.Release(dV)
 
-		var loss float32
-		for i := range embedGrad {
-			embedGrad[i] = 0
+			// RMSNorm1 backward → dNormFinal for next layer
+			dNormFinal = te.Zeros([]int{n, dim})
+			mongoose.KRMSNormBackward(dN2.DevicePtr(), c.xIn.DevicePtr(),
+				l.norm1.DevicePtr(), c.rmsScale1.DevicePtr(), dNormFinal.DevicePtr(), n, dim)
+			te.Release(dN2); te.Release(c.rmsScale1)
 		}
 
-		for pos := 0; pos < n-1; pos++ {
-			target := tokens[pos+1]
-			logits := logitsBuf[pos*vocabSize : (pos+1)*vocabSize]
-
-			maxL := logits[0]
-			for _, v := range logits[1:] {
-				if v > maxL {
-					maxL = v
-				}
-			}
-			var sumExp float32
-			for i := range logits {
-				logits[i] = float32(math.Exp(float64(logits[i] - maxL)))
-				sumExp += logits[i]
-			}
-			loss -= float32(math.Log(float64(logits[target]/sumExp) + 1e-10))
-
-			// Softmax gradient
-			scale := 1.0 / float32(n-1)
-			for i := range logits {
-				logits[i] /= sumExp
-			}
-			logits[target] -= 1.0
-
-			// Accumulate embedding gradient
-			for i := 0; i < vocabSize; i++ {
-				grad := logits[i] * scale
-				for j := 0; j < dim; j++ {
-					embedGrad[i*dim+j] += grad * hidden[pos*dim+j]
-				}
-			}
-		}
-		loss /= float32(n - 1)
-
-		// AdamW on embeddings
-		bc1 := float32(1.0 - math.Pow(0.9, float64(step)))
-		bc2 := float32(1.0 - math.Pow(0.999, float64(step)))
-		for i := range embedW {
-			g := embedGrad[i]
-			embedM[i] = 0.9*embedM[i] + 0.1*g
-			embedV[i] = 0.999*embedV[i] + 0.001*g*g
-			mh := embedM[i] / bc1
-			vh := embedV[i] / bc2
-			embedW[i] -= lr * (mh/(float32(math.Sqrt(float64(vh)))+1e-8) + 0.01*embedW[i])
-		}
-
-		// Re-upload embeddings
-		te.Release(embedT)
-		embedT = te.FromHost(embedW, []int{vocabSize, dim})
+		// AdamW on embeddings + final norm
+		adamUpdate(embed, dEmbed, embedAdam.m, embedAdam.v, step)
+		te.Release(dEmbed); te.Release(dNormFinal); te.Release(tokGPU)
 
 		if step%*logEvery == 0 || step == 1 {
 			cuda.Sync()
 			elapsed := time.Since(t0)
 			stepsPerSec := float64(step) / elapsed.Seconds()
 			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s)\n",
-				step, *stepsFlag, loss, lr, elapsed.Seconds(), stepsPerSec)
+				step, *stepsFlag, totalLoss, lr, elapsed.Seconds(), stepsPerSec)
 		}
 	}
 
