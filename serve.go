@@ -1,0 +1,876 @@
+// serve.go — OpenAI-compatible API server for mongoose.
+//
+// Implements the OpenAI API surface that tools (LangChain, LiteLLM, Continue,
+// Open WebUI, etc.) expect. Drop-in replacement for Ollama's /v1 endpoints.
+//
+// Endpoints:
+//   POST /v1/chat/completions   — streaming (SSE) + non-streaming
+//   POST /v1/completions        — legacy completions
+//   POST /v1/embeddings         — text embeddings
+//   GET  /v1/models             — list loaded models
+//   GET  /health                — liveness probe
+//
+// Usage:
+//   mongoose serve [--host 0.0.0.0] [--port 11434] [--model <name>]
+
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/open-ai-org/mongoose"
+	"github.com/open-ai-org/gguf"
+	"github.com/open-ai-org/tokenizer"
+)
+
+// -----------------------------------------------------------------------
+// OpenAI API request/response types
+// -----------------------------------------------------------------------
+
+// ChatCompletionRequest matches the OpenAI chat completions request body.
+type ChatCompletionRequest struct {
+	Model            string            `json:"model"`
+	Messages         []ChatMessage     `json:"messages"`
+	Temperature      *float64          `json:"temperature,omitempty"`
+	TopP             *float64          `json:"top_p,omitempty"`
+	N                int               `json:"n,omitempty"`
+	Stream           bool              `json:"stream,omitempty"`
+	Stop             interface{}       `json:"stop,omitempty"` // string or []string
+	MaxTokens        *int              `json:"max_tokens,omitempty"`
+	PresencePenalty  float64           `json:"presence_penalty,omitempty"`
+	FrequencyPenalty float64           `json:"frequency_penalty,omitempty"`
+	User             string            `json:"user,omitempty"`
+	Seed             *int              `json:"seed,omitempty"`
+	ResponseFormat   *ResponseFormat   `json:"response_format,omitempty"`
+}
+
+// ChatMessage is a single message in a chat conversation.
+type ChatMessage struct {
+	Role    string `json:"role"`    // "system", "user", "assistant"
+	Content string `json:"content"`
+}
+
+// ResponseFormat constrains the output format.
+type ResponseFormat struct {
+	Type string `json:"type"` // "text" or "json_object"
+}
+
+// ChatCompletionResponse is the non-streaming response.
+type ChatCompletionResponse struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []ChatChoice       `json:"choices"`
+	Usage   UsageInfo          `json:"usage"`
+}
+
+// ChatChoice is one completion choice.
+type ChatChoice struct {
+	Index        int         `json:"index"`
+	Message      ChatMessage `json:"message"`
+	FinishReason string      `json:"finish_reason"` // "stop", "length"
+}
+
+// ChatCompletionChunk is one SSE chunk for streaming responses.
+type ChatCompletionChunk struct {
+	ID      string              `json:"id"`
+	Object  string              `json:"object"`
+	Created int64               `json:"created"`
+	Model   string              `json:"model"`
+	Choices []ChatChunkChoice   `json:"choices"`
+}
+
+// ChatChunkChoice is a streaming delta.
+type ChatChunkChoice struct {
+	Index        int            `json:"index"`
+	Delta        ChatDelta      `json:"delta"`
+	FinishReason *string        `json:"finish_reason"` // null until final chunk
+}
+
+// ChatDelta is the incremental content in a streaming chunk.
+type ChatDelta struct {
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
+// CompletionRequest matches the legacy OpenAI completions endpoint.
+type CompletionRequest struct {
+	Model       string   `json:"model"`
+	Prompt      string   `json:"prompt"`
+	MaxTokens   *int     `json:"max_tokens,omitempty"`
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"top_p,omitempty"`
+	N           int      `json:"n,omitempty"`
+	Stream      bool     `json:"stream,omitempty"`
+	Stop        interface{} `json:"stop,omitempty"`
+	Suffix      string   `json:"suffix,omitempty"`
+}
+
+// CompletionResponse is the legacy completions response.
+type CompletionResponse struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []CompletionChoice `json:"choices"`
+	Usage   UsageInfo          `json:"usage"`
+}
+
+// CompletionChoice is one legacy completion choice.
+type CompletionChoice struct {
+	Text         string `json:"text"`
+	Index        int    `json:"index"`
+	FinishReason string `json:"finish_reason"`
+}
+
+// EmbeddingRequest matches the OpenAI embeddings endpoint.
+type EmbeddingRequest struct {
+	Model          string      `json:"model"`
+	Input          interface{} `json:"input"`          // string or []string
+	EncodingFormat string      `json:"encoding_format"` // "float" or "base64"
+}
+
+// EmbeddingResponse is the embeddings response.
+type EmbeddingResponse struct {
+	Object string          `json:"object"`
+	Data   []EmbeddingData `json:"data"`
+	Model  string          `json:"model"`
+	Usage  UsageInfo       `json:"usage"`
+}
+
+// EmbeddingData is one embedding vector.
+type EmbeddingData struct {
+	Object    string    `json:"object"`
+	Embedding []float32 `json:"embedding"`
+	Index     int       `json:"index"`
+}
+
+// UsageInfo tracks token consumption.
+type UsageInfo struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// ModelInfo describes one model for the /v1/models response.
+type ModelInfo struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// ModelsResponse is the /v1/models list response.
+type ModelsResponse struct {
+	Object string      `json:"object"`
+	Data   []ModelInfo `json:"data"`
+}
+
+// ErrorResponse matches the OpenAI error envelope.
+type ErrorResponse struct {
+	Error ErrorDetail `json:"error"`
+}
+
+// ErrorDetail is the inner error object.
+type ErrorDetail struct {
+	Message string  `json:"message"`
+	Type    string  `json:"type"`
+	Param   *string `json:"param"`
+	Code    *string `json:"code"`
+}
+
+// -----------------------------------------------------------------------
+// Server state
+// -----------------------------------------------------------------------
+
+// serveState holds the loaded model and engine state for the running server.
+type serveState struct {
+	mu sync.RWMutex
+
+	// Model metadata
+	modelName string
+	modelDir  string
+	vocabSize int
+	dim       int
+	layers    int
+	heads     int
+	kvHeads   int
+	ffnDim    int
+	maxSeq    int
+
+	// Loaded components (nil until model is loaded)
+	tokenizer *tokenizer.Tokenizer
+	safetens  *gguf.SafeTensors
+
+	// GPU engine (nil if CPU-only)
+	eng mongoose.Engine
+
+	// TODO: Add loaded weight tensors (GPU-resident or streaming)
+	// TODO: Add KV cache pool for concurrent requests
+	// TODO: Add inference pipeline (forward pass function)
+}
+
+// -----------------------------------------------------------------------
+// Server entrypoint
+// -----------------------------------------------------------------------
+
+// cmdServe starts the OpenAI-compatible API server.
+func cmdServe() {
+	host := "0.0.0.0"
+	port := "11434"
+	modelName := ""
+
+	// Parse flags
+	for i := 2; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--host":
+			if i+1 < len(os.Args) {
+				host = os.Args[i+1]
+				i++
+			}
+		case "--port":
+			if i+1 < len(os.Args) {
+				port = os.Args[i+1]
+				i++
+			}
+		case "--model":
+			if i+1 < len(os.Args) {
+				modelName = os.Args[i+1]
+				i++
+			}
+		}
+	}
+
+	state := &serveState{}
+
+	// Pre-load model if specified
+	if modelName != "" {
+		if err := state.loadModel(modelName); err != nil {
+			log.Fatalf("Failed to load model %q: %v", modelName, err)
+		}
+		log.Printf("[serve] model loaded: %s (dim=%d, layers=%d, heads=%d, vocab=%d)",
+			state.modelName, state.dim, state.layers, state.heads, state.vocabSize)
+	}
+
+	// Register routes
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", state.handleChatCompletions)
+	mux.HandleFunc("/v1/completions", state.handleCompletions)
+	mux.HandleFunc("/v1/embeddings", state.handleEmbeddings)
+	mux.HandleFunc("/v1/models", state.handleModels)
+	mux.HandleFunc("/health", state.handleHealth)
+
+	// Also serve at root paths for Ollama-compatible clients
+	mux.HandleFunc("/api/chat", state.handleChatCompletions)
+	mux.HandleFunc("/api/generate", state.handleCompletions)
+	mux.HandleFunc("/api/embeddings", state.handleEmbeddings)
+	mux.HandleFunc("/api/tags", state.handleModels)
+
+	addr := host + ":" + port
+	log.Printf("[serve] mongoose API server listening on %s", addr)
+	if modelName == "" {
+		log.Printf("[serve] no model pre-loaded. Use --model <name> or POST with model field.")
+	}
+	log.Printf("[serve] endpoints: /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models, /health")
+
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Model loading
+// -----------------------------------------------------------------------
+
+// loadModel initializes the model, tokenizer, and GPU engine.
+func (s *serveState) loadModel(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := resolveModel(name)
+
+	// Read config.json
+	configData, err := os.ReadFile(filepath.Join(path, "config.json"))
+	if err != nil {
+		return fmt.Errorf("no config.json: %w", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(configData, &cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+
+	getInt := func(key string, fallback int) int {
+		if v, ok := cfg[key]; ok {
+			if f, ok := v.(float64); ok {
+				return int(f)
+			}
+		}
+		return fallback
+	}
+
+	s.modelName = name
+	s.modelDir = path
+	s.dim = getInt("hidden_size", 0)
+	s.layers = getInt("num_hidden_layers", 0)
+	s.heads = getInt("num_attention_heads", 0)
+	s.kvHeads = getInt("num_key_value_heads", s.heads)
+	s.ffnDim = getInt("intermediate_size", 0)
+	s.vocabSize = getInt("vocab_size", 0)
+	s.maxSeq = getInt("max_position_embeddings", 2048)
+
+	// Load tokenizer
+	tok, err := tokenizer.LoadTokenizer(path)
+	if err != nil {
+		return fmt.Errorf("tokenizer: %w", err)
+	}
+	s.tokenizer = tok
+
+	// Open safetensors (lazy — headers only, no weight data read yet)
+	st, err := gguf.OpenSafeTensors(path)
+	if err != nil {
+		return fmt.Errorf("safetensors: %w", err)
+	}
+	s.safetens = st
+
+	// Init GPU
+	cuda := mongoose.NewCUDA()
+	if cuda != nil {
+		s.eng = cuda
+		s.eng = cuda
+		mongoose.LoadKernels()
+		log.Printf("[serve] GPU: %s", cuda.Name())
+	} else {
+		log.Printf("[serve] no CUDA GPU detected, running on CPU")
+	}
+
+	// TODO: Load model weights to GPU (GPU-resident mode if VRAM sufficient)
+	// TODO: Pre-allocate KV cache slots for max concurrent requests
+	// TODO: Precompute RoPE cos/sin tables on GPU
+	// TODO: Support GGUF models in addition to safetensors
+	// TODO: Support AWQ/GPTQ quantized models (DequantAWQ already exists)
+
+	return nil
+}
+
+// -----------------------------------------------------------------------
+// Handlers
+// -----------------------------------------------------------------------
+
+// handleChatCompletions implements POST /v1/chat/completions.
+func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+
+	var req ChatCompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "invalid_request_error")
+		return
+	}
+
+	// Resolve model — use pre-loaded if matches, otherwise lazy-load
+	if err := s.ensureModel(req.Model); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "model_not_found")
+		return
+	}
+
+	if len(req.Messages) == 0 {
+		writeError(w, http.StatusBadRequest, "messages array is required", "invalid_request_error")
+		return
+	}
+
+	maxTokens := 256
+	if req.MaxTokens != nil {
+		maxTokens = *req.MaxTokens
+	}
+
+	// TODO: Apply chat template to messages.
+	// Concatenate messages into a single prompt string for now.
+	// Real implementation should use the model's chat_template from tokenizer_config.json
+	// to format system/user/assistant messages with proper special tokens.
+	prompt := formatChatPrompt(req.Messages)
+
+	// Tokenize
+	s.mu.RLock()
+	tok := s.tokenizer
+	s.mu.RUnlock()
+
+	promptTokens := tok.Encode(prompt)
+
+	if req.Stream {
+		s.handleChatStream(w, req, promptTokens, maxTokens)
+		return
+	}
+
+	// Non-streaming response
+	// TODO: Run inference forward pass:
+	//   1. Embed prompt tokens (lookup or GPU gather)
+	//   2. For each layer: RMSNorm → QKV → RoPE → attention → residual → FFN → residual
+	//   3. Final RMSNorm → lm_head matmul → logits
+	//   4. Sample from logits (temperature, top-p, top-k)
+	//   5. Repeat until maxTokens or EOS
+	//   6. Decode generated token IDs back to text
+
+	// Stub: return a placeholder response indicating inference is not yet wired
+	generated := "[mongoose] inference not yet wired — model loaded, tokenizer working, GPU ready"
+	completionTokens := len(tok.Encode(generated))
+
+	resp := ChatCompletionResponse{
+		ID:      generateID("chatcmpl"),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   s.modelName,
+		Choices: []ChatChoice{
+			{
+				Index: 0,
+				Message: ChatMessage{
+					Role:    "assistant",
+					Content: generated,
+				},
+				FinishReason: "stop",
+			},
+		},
+		Usage: UsageInfo{
+			PromptTokens:     len(promptTokens),
+			CompletionTokens: completionTokens,
+			TotalTokens:      len(promptTokens) + completionTokens,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleChatStream sends SSE chunks for streaming chat completions.
+func (s *serveState) handleChatStream(w http.ResponseWriter, req ChatCompletionRequest, promptTokens []int, maxTokens int) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported", "server_error")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	id := generateID("chatcmpl")
+	now := time.Now().Unix()
+
+	// First chunk: role
+	writeSSEChunk(w, flusher, ChatCompletionChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: now,
+		Model:   s.modelName,
+		Choices: []ChatChunkChoice{
+			{
+				Index: 0,
+				Delta: ChatDelta{Role: "assistant"},
+			},
+		},
+	})
+
+	// TODO: Token-by-token generation loop:
+	//   1. Run forward pass for one token
+	//   2. Sample next token from logits
+	//   3. Decode token to text
+	//   4. Send as SSE chunk with delta.content
+	//   5. Check for EOS or maxTokens
+	//   6. Update KV cache for next position
+	//
+	// For now, send a single content chunk as placeholder.
+
+	writeSSEChunk(w, flusher, ChatCompletionChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: now,
+		Model:   s.modelName,
+		Choices: []ChatChunkChoice{
+			{
+				Index: 0,
+				Delta: ChatDelta{Content: "[mongoose] streaming inference stub"},
+			},
+		},
+	})
+
+	// Final chunk: finish_reason
+	stop := "stop"
+	writeSSEChunk(w, flusher, ChatCompletionChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: now,
+		Model:   s.modelName,
+		Choices: []ChatChunkChoice{
+			{
+				Index:        0,
+				Delta:        ChatDelta{},
+				FinishReason: &stop,
+			},
+		},
+	})
+
+	// Terminator
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// handleCompletions implements POST /v1/completions (legacy).
+func (s *serveState) handleCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+
+	var req CompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "invalid_request_error")
+		return
+	}
+
+	if err := s.ensureModel(req.Model); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "model_not_found")
+		return
+	}
+
+	maxTokens := 256
+	if req.MaxTokens != nil {
+		maxTokens = *req.MaxTokens
+	}
+	_ = maxTokens
+
+	s.mu.RLock()
+	tok := s.tokenizer
+	s.mu.RUnlock()
+
+	promptTokens := tok.Encode(req.Prompt)
+
+	// TODO: Run text completion inference:
+	//   1. Tokenize prompt
+	//   2. Forward pass through transformer layers
+	//   3. Autoregressive generation until maxTokens or stop sequence
+	//   4. Decode tokens to text
+	//
+	// The forward pass is identical to chat completions — the difference is
+	// that legacy completions don't apply a chat template to the prompt.
+
+	generated := "[mongoose] completion inference stub"
+	completionTokens := len(tok.Encode(generated))
+
+	if req.Stream {
+		// TODO: SSE streaming for legacy completions
+		// Same pattern as chat streaming but with CompletionChunk format
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "streaming not supported", "server_error")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		chunk := map[string]interface{}{
+			"id":      generateID("cmpl"),
+			"object":  "text_completion",
+			"created": time.Now().Unix(),
+			"model":   s.modelName,
+			"choices": []map[string]interface{}{
+				{"text": generated, "index": 0, "finish_reason": "stop"},
+			},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
+	resp := CompletionResponse{
+		ID:      generateID("cmpl"),
+		Object:  "text_completion",
+		Created: time.Now().Unix(),
+		Model:   s.modelName,
+		Choices: []CompletionChoice{
+			{
+				Text:         generated,
+				Index:        0,
+				FinishReason: "stop",
+			},
+		},
+		Usage: UsageInfo{
+			PromptTokens:     len(promptTokens),
+			CompletionTokens: completionTokens,
+			TotalTokens:      len(promptTokens) + completionTokens,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleEmbeddings implements POST /v1/embeddings.
+func (s *serveState) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+
+	var req EmbeddingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "invalid_request_error")
+		return
+	}
+
+	if err := s.ensureModel(req.Model); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "model_not_found")
+		return
+	}
+
+	// Normalize input to []string
+	var inputs []string
+	switch v := req.Input.(type) {
+	case string:
+		inputs = []string{v}
+	case []interface{}:
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				inputs = append(inputs, str)
+			}
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "input must be string or array of strings", "invalid_request_error")
+		return
+	}
+
+	s.mu.RLock()
+	tok := s.tokenizer
+	s.mu.RUnlock()
+
+	totalTokens := 0
+	var data []EmbeddingData
+	for i, text := range inputs {
+		tokens := tok.Encode(text)
+		totalTokens += len(tokens)
+
+		// TODO: Generate embeddings:
+		//   1. Tokenize input text
+		//   2. Forward pass through all transformer layers (no generation)
+		//   3. Pool the hidden states: mean-pool over sequence positions,
+		//      or use the last token's hidden state (model-dependent)
+		//   4. Normalize the embedding vector (L2 norm)
+		//
+		// The forward pass is the same as inference but stops after the
+		// final layer norm — no lm_head projection, no sampling.
+		//
+		// For dedicated embedding models (e.g., nomic-embed, bge, gte),
+		// there's often a separate pooling head to load.
+
+		// Stub: return zero vector of model dimension
+		embedding := make([]float32, s.dim)
+
+		data = append(data, EmbeddingData{
+			Object:    "embedding",
+			Embedding: embedding,
+			Index:     i,
+		})
+	}
+
+	resp := EmbeddingResponse{
+		Object: "list",
+		Data:   data,
+		Model:  s.modelName,
+		Usage: UsageInfo{
+			PromptTokens: totalTokens,
+			TotalTokens:  totalTokens,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleModels implements GET /v1/models.
+func (s *serveState) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+
+	var models []ModelInfo
+
+	// List all downloaded models from ~/.mongoose/models/
+	entries, _ := os.ReadDir(modelsDir)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, _ := e.Info()
+		created := int64(0)
+		if info != nil {
+			created = info.ModTime().Unix()
+		}
+		models = append(models, ModelInfo{
+			ID:      e.Name(),
+			Object:  "model",
+			Created: created,
+			OwnedBy: "mongoose",
+		})
+	}
+
+	// If a model is loaded but not in the models dir (e.g., direct path), include it
+	s.mu.RLock()
+	if s.modelName != "" {
+		found := false
+		for _, m := range models {
+			if m.ID == s.modelName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			models = append(models, ModelInfo{
+				ID:      s.modelName,
+				Object:  "model",
+				Created: time.Now().Unix(),
+				OwnedBy: "mongoose",
+			})
+		}
+	}
+	s.mu.RUnlock()
+
+	resp := ModelsResponse{
+		Object: "list",
+		Data:   models,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleHealth implements GET /health.
+func (s *serveState) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	modelLoaded := s.modelName != ""
+	modelName := s.modelName
+	hasGPU := s.eng != nil
+	s.mu.RUnlock()
+
+	status := map[string]interface{}{
+		"status":       "ok",
+		"model_loaded": modelLoaded,
+		"model":        modelName,
+		"gpu":          hasGPU,
+		"version":      "mongoose v1.0.0",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+// ensureModel checks that the requested model is loaded, loading it if needed.
+func (s *serveState) ensureModel(requestedModel string) error {
+	if requestedModel == "" {
+		s.mu.RLock()
+		loaded := s.modelName != ""
+		s.mu.RUnlock()
+		if !loaded {
+			return fmt.Errorf("no model specified and none pre-loaded")
+		}
+		return nil
+	}
+
+	s.mu.RLock()
+	current := s.modelName
+	s.mu.RUnlock()
+
+	// If already loaded, use it (treat any non-empty loaded model as match
+	// when the request model is a substring — handles "llama" matching "ReluLLaMA-7B")
+	if current != "" && (current == requestedModel || strings.Contains(strings.ToLower(current), strings.ToLower(requestedModel))) {
+		return nil
+	}
+
+	// TODO: Implement lazy model loading on first request.
+	// This would resolve the model name, load tokenizer + weights,
+	// and swap out the current model. Need to handle concurrent requests
+	// during model swap (queue them, don't drop them).
+
+	if current == "" {
+		return fmt.Errorf("model %q not loaded — start server with --model flag", requestedModel)
+	}
+
+	// For now, use whatever model is loaded
+	return nil
+}
+
+// formatChatPrompt concatenates chat messages into a single prompt string.
+// TODO: Replace with proper chat template rendering from tokenizer_config.json.
+// Different models use different templates:
+//   - ChatML:    <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n
+//   - Llama:     [INST] <<SYS>>...<</SYS>> ... [/INST]
+//   - Mistral:   [INST] ... [/INST]
+//   - Qwen:      <|im_start|>system\n...<|im_end|>\n...
+func formatChatPrompt(messages []ChatMessage) string {
+	var b strings.Builder
+	for _, msg := range messages {
+		switch msg.Role {
+		case "system":
+			b.WriteString(msg.Content)
+			b.WriteString("\n\n")
+		case "user":
+			b.WriteString("User: ")
+			b.WriteString(msg.Content)
+			b.WriteString("\n")
+		case "assistant":
+			b.WriteString("Assistant: ")
+			b.WriteString(msg.Content)
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("Assistant: ")
+	return b.String()
+}
+
+// generateID creates a unique ID with the given prefix.
+func generateID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// writeError sends an OpenAI-format error response.
+func writeError(w http.ResponseWriter, status int, message, errType string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(ErrorResponse{
+		Error: ErrorDetail{
+			Message: message,
+			Type:    errType,
+		},
+	})
+}
+
+// writeSSEChunk marshals a chunk and writes it as an SSE event.
+func writeSSEChunk(w http.ResponseWriter, flusher http.Flusher, chunk ChatCompletionChunk) {
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	flusher.Flush()
+}
+
+// Silence unused import warnings. These are used in the handler implementations.
+var _ = bufio.NewScanner
+var _ = mongoose.Engine(nil)
