@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/open-ai-org/gguf"
+	"github.com/open-ai-org/helix"
 	"github.com/open-ai-org/mongoose"
 )
 
@@ -112,6 +113,9 @@ func cmdTrainCUDA() {
 		}
 	}
 
+	// Helix optimizer — DNA-coupled gradient descent
+	hlx := helix.NewHelixOptimizer(lr, 0.9, 0.95, 1e-8, 0.1)
+
 	type as struct{ m, v *mongoose.Tensor }
 	newAS := func(sz int) as { return as{te.Zeros([]int{sz}), te.Zeros([]int{sz})} }
 	embedAS := newAS(vocabSize * dim)
@@ -173,7 +177,7 @@ func cmdTrainCUDA() {
 		nParams += dim + dim*dim + kvDim*dim*2 + dim*dim + dim + ffnDim*dim*2 + dim*ffnDim
 	}
 
-	fmt.Println("ai train — zero-alloc GPU kernels + AdamW")
+	fmt.Println("ai train — GPU kernels + Helix DNA optimizer")
 	fmt.Printf("  engine:   %s\n", eng.Name())
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
 	fmt.Printf("  model:    dim=%d heads=%d kv=%d layers=%d ffn=%d seq=%d vocab=%d\n",
@@ -187,8 +191,7 @@ func cmdTrainCUDA() {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	totalSteps := *stepsFlag
-	warmupSteps := totalSteps / 10
-	if warmupSteps < 10 { warmupSteps = 10 }
+	warmupSteps := 1
 	minLR := lr / 10.0
 
 	getLR := func(step int) float32 {
@@ -246,8 +249,10 @@ func cmdTrainCUDA() {
 	fmt.Println("Training...")
 	t0 := time.Now()
 
+	var batchStart int
 	for step := 1; step <= *stepsFlag; step++ {
 		if l3 != nil {
+			batchStart = start0
 			tmpTok := te.FromHost(nextTokL3, []int{n})
 			cuda.CopyInto(tokGPU, tmpTok)
 			te.Release(tmpTok)
@@ -255,14 +260,14 @@ func cmdTrainCUDA() {
 			cuda.CopyInto(targetsGPU, tmpTarg)
 			te.Release(tmpTarg)
 		} else {
-			start := rng.Intn(len(data) - n - 1)
+			batchStart = rng.Intn(len(data) - n - 1)
 			tokF := make([]float32, n)
-			for i := 0; i < n; i++ { tokF[i] = math.Float32frombits(uint32(int32(data[start+i]))) }
+			for i := 0; i < n; i++ { tokF[i] = math.Float32frombits(uint32(int32(data[batchStart+i]))) }
 			tmpTok := te.FromHost(tokF, []int{n})
 			cuda.CopyInto(tokGPU, tmpTok)
 			te.Release(tmpTok)
 			targF := make([]float32, n)
-			for i := 0; i < n; i++ { targF[i] = math.Float32frombits(uint32(int32(data[start+i+1]))) }
+			for i := 0; i < n; i++ { targF[i] = math.Float32frombits(uint32(int32(data[batchStart+i+1]))) }
 			tmpTarg := te.FromHost(targF, []int{n})
 			cuda.CopyInto(targetsGPU, tmpTarg)
 			te.Release(tmpTarg)
@@ -330,14 +335,12 @@ func cmdTrainCUDA() {
 		mongoose.KSoftmaxCE(logitsBuf.DevicePtr(), targetsGPU.DevicePtr(),
 			lossesGPU.DevicePtr(), gradGPU.DevicePtr(), n, vocabSize, invN)
 
-		// Deferred loss read — only sync on log steps
+		// Always read loss — helix immune system needs it every step
+		cuda.Sync()
 		var stepLoss float32
-		if step <= 3 || step%*logEvery == 0 {
-			cuda.Sync()
-			lossH := te.ToHost(lossesGPU)
-			for _, l := range lossH { stepLoss += l }
-			stepLoss /= float32(n)
-		}
+		lossH := te.ToHost(lossesGPU)
+		for _, l := range lossH { stepLoss += l }
+		stepLoss /= float32(n)
 
 		// === BACKWARD ===
 		cuda.MatMulTransposeATInto(dEmbed, gradGPU, normedFinal, n, vocabSize, dim)
@@ -354,7 +357,6 @@ func cmdTrainCUDA() {
 
 			cuda.MatMulTInto(b.dFfnMid, dHidden, l.down, n, dim, ffnDim)
 			cuda.MatMulTransposeATInto(b.dWDown, dHidden, b.ffnMid, n, dim, ffnDim)
-			adamW(l.down, b.dWDown, layAS[li].down.m, layAS[li].down.v, step)
 
 			zero(b.dGate); zero(b.dUp)
 			mongoose.KSiLUGateBackward(b.dFfnMid.DevicePtr(), b.gatePre.DevicePtr(),
@@ -366,8 +368,6 @@ func cmdTrainCUDA() {
 
 			cuda.MatMulTransposeATInto(b.dWGate, b.dGate, b.normed2, n, ffnDim, dim)
 			cuda.MatMulTransposeATInto(b.dWUp, b.dUp, b.normed2, n, ffnDim, dim)
-			adamW(l.gate, b.dWGate, layAS[li].gate.m, layAS[li].gate.v, step)
-			adamW(l.up, b.dWUp, layAS[li].up.m, layAS[li].up.v, step)
 
 			zero(b.dx)
 			mongoose.KRMSNormBackward(b.dN2.DevicePtr(), b.xMid.DevicePtr(),
@@ -376,7 +376,6 @@ func cmdTrainCUDA() {
 
 			cuda.MatMulTInto(b.dAttnOut, dHidden, l.wo, n, dim, dim)
 			cuda.MatMulTransposeATInto(b.dWO, dHidden, b.attnOut, n, dim, dim)
-			adamW(l.wo, b.dWO, layAS[li].wo.m, layAS[li].wo.v, step)
 
 			zero(b.dQ); zero(b.dK); zero(b.dV)
 			mongoose.KCausalAttentionBackward(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.dAttnOut.DevicePtr(),
@@ -393,14 +392,26 @@ func cmdTrainCUDA() {
 			cuda.MatMulTransposeATInto(b.dWQ, b.dQ, b.normed, n, dim, dim)
 			cuda.MatMulTransposeATInto(b.dWK, b.dK, b.normed, n, kvDim, dim)
 			cuda.MatMulTransposeATInto(b.dWV, b.dV, b.normed, n, kvDim, dim)
-			adamW(l.wq, b.dWQ, layAS[li].wq.m, layAS[li].wq.v, step)
-			adamW(l.wk, b.dWK, layAS[li].wk.m, layAS[li].wk.v, step)
-			adamW(l.wv, b.dWV, layAS[li].wv.m, layAS[li].wv.v, step)
 
 			zero(b.dx)
 			mongoose.KRMSNormBackward(b.dN1.DevicePtr(), b.xIn.DevicePtr(),
 				l.norm1.DevicePtr(), b.rmsScale1.DevicePtr(), b.dx.DevicePtr(), n, dim)
 			te.AddInPlace(dHidden, b.dx)
+		}
+
+		// === TEST 3: Pure AdamW, no helix, batched after backward ===
+		hlx.Step(step, stepLoss, getLR(step))
+
+		for li := range lays {
+			b := &bufs[li]
+			la := &layAS[li]
+			adamW(lays[li].gate, b.dWGate, la.gate.m, la.gate.v, step)
+			adamW(lays[li].up, b.dWUp, la.up.m, la.up.v, step)
+			adamW(lays[li].wq, b.dWQ, la.wq.m, la.wq.v, step)
+			adamW(lays[li].wk, b.dWK, la.wk.m, la.wk.v, step)
+			adamW(lays[li].wv, b.dWV, la.wv.m, la.wv.v, step)
+			adamW(lays[li].wo, b.dWO, la.wo.m, la.wo.v, step)
+			adamW(lays[li].down, b.dWDown, la.down.m, la.down.v, step)
 		}
 
 		adamW(embed, dEmbed, embedAS.m, embedAS.v, step)
