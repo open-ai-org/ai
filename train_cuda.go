@@ -213,12 +213,27 @@ func cmdTrainCUDA() {
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
 	}
 
-	l3Size := n * 4 * 2
+	// L3 bridge: pointers + rung + batch data
+	// GPU-write: 49 hot row addresses (float32-encoded pointers)
+	// CPU-write: 6 rung coefficients
+	// Batch: tokens + targets
+	const nSparse = 49
+	gpuWriteOff := 0                         // 49 × 4 = 196 bytes
+	cpuWriteOff := nSparse*4 + 4             // 6 × 4 = 24 bytes
+	batchOff := cpuWriteOff + 6*4 + 4        // n×4×2 bytes
+	l3Size := batchOff + n*4*2
 	l3 := cuda.AllocL3Bridge(l3Size)
+
+	var hotRowsL3 []float32  // GPU-write: 49 hot row indices
+	var rungL3 []float32     // CPU-write: 6 rung coefficients
 	var nextTokL3, nextTargL3 []float32
 	if l3 != nil {
-		nextTokL3 = l3.Float32(0, n)
-		nextTargL3 = l3.Float32(n*4, n)
+		hotRowsL3 = l3.Float32(gpuWriteOff, nSparse)
+		rungL3 = l3.Float32(cpuWriteOff, 6)
+		nextTokL3 = l3.Float32(batchOff, n)
+		nextTargL3 = l3.Float32(batchOff+n*4, n)
+		log.Printf("[L3] bridge: %d bytes (hotRows:%d rung:%d batch:%d)",
+			l3Size, nSparse*4, 6*4, n*4*2)
 	}
 
 	prepBatch := func(start int) {
@@ -402,6 +417,22 @@ func cmdTrainCUDA() {
 			te.AddInPlace(dHidden, b.dx)
 		}
 
+		// === L3 signal exchange ===
+		// GPU-write: conductor hot row indices → L3
+		// CPU: helix reads hot rows, computes rung, writes rung → L3
+		// GPU: optimizer reads rung from L3
+		if l3 != nil {
+			hotRows := conductor.HotRows()
+			nHot := len(hotRows)
+			if nHot > nSparse { nHot = nSparse }
+			for i := 0; i < nHot; i++ {
+				hotRowsL3[i] = float32(hotRows[i])
+			}
+			for i := nHot; i < nSparse; i++ {
+				hotRowsL3[i] = -1
+			}
+		}
+
 		// === HELIX DNA optimizer with immune response ===
 		stepLR := getLR(step)
 		r, _, _, rewound := hlx.PrepareStep(step, stepLoss, stepLR)
@@ -412,6 +443,16 @@ func cmdTrainCUDA() {
 					step, *stepsFlag, stepLoss, stepLR, elapsed.Seconds(), float64(step)/elapsed.Seconds())
 			}
 			continue
+		}
+
+		// CPU-write: rung coefficients → L3
+		if l3 != nil {
+			rungL3[0] = r.Backbone1
+			rungL3[1] = r.Glyco1
+			rungL3[2] = r.Hbond1
+			rungL3[3] = r.Hbond2
+			rungL3[4] = r.Glyco2
+			rungL3[5] = r.Backbone2
 		}
 
 		for li := range lays {
