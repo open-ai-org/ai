@@ -163,6 +163,16 @@ func cmdTrain() {
 	fmt.Println("Training...")
 	t0 := time.Now()
 
+	// Immune system for GraphTrainEngine: can't undo weight updates,
+	// but can zero LR on rebound (next step = no-op update)
+	bestFloor := float32(1e30)
+	immuneActive := false
+	floorContactStep := 0
+	floorWindow := 10
+	maxRecoveries := 20
+	recoveryCount := 0
+	baseLR := float32(*lrFlag)
+
 	var prevLoss float32
 	for step := 1; step <= *stepsFlag; step++ {
 		start := rng.Intn(len(data) - n - 1)
@@ -176,15 +186,39 @@ func cmdTrain() {
 
 		loss := graph.GraphTrainStepAdam(tokens, targets, lr)
 
-		// Signal-driven LR dampening for next step
+		// Floor detection
+		if loss > 0 && loss < bestFloor {
+			bestFloor = loss
+			if !immuneActive {
+				immuneActive = true
+				floorContactStep = step
+				recoveryCount = 0
+			}
+		}
+
+		// Immune monitoring: zero LR on rebound
+		if immuneActive && step-floorContactStep >= floorWindow {
+			rebound := loss - bestFloor
+			threshold := bestFloor * 0.05
+			if rebound > threshold && recoveryCount < maxRecoveries {
+				lr = 0 // next step is a no-op
+				recoveryCount++
+				immuneActive = false
+				fmt.Printf("step %5d  [IMMUNE → floor %.3f]\n", step, bestFloor)
+			} else {
+				immuneActive = false
+			}
+		}
+
+		// Signal-driven LR dampening
 		if step > 1 && prevLoss > 0 {
 			dLoss := float64(loss) - float64(prevLoss)
 			if dLoss > 0 {
 				ratio := float32(dLoss / math.Max(float64(prevLoss), 1e-6))
 				if ratio > 1.0 { ratio = 1.0 }
-				lr = float32(*lrFlag) * (1.0 - ratio)
+				lr = baseLR * (1.0 - ratio)
 			} else {
-				lr = float32(*lrFlag)
+				lr = baseLR
 			}
 		}
 		prevLoss = loss
@@ -193,14 +227,15 @@ func cmdTrain() {
 			graph.Sync()
 			elapsed := time.Since(t0)
 			stepsPerSec := float64(step) / elapsed.Seconds()
-			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s)\n",
-				step, *stepsFlag, loss, lr, elapsed.Seconds(), stepsPerSec)
+			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  floor=%.3f  %.0fs  (%.1f steps/s)\n",
+				step, *stepsFlag, loss, lr, bestFloor, elapsed.Seconds(), stepsPerSec)
 		}
 	}
 
 	graph.Sync()
 	total := time.Since(t0)
-	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)\n", *stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds())
+	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)  floor=%.3f\n",
+		*stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds(), bestFloor)
 
 	os.MkdirAll(*saveDir, 0755)
 	fmt.Printf("Model saved to: %s\n", *saveDir)

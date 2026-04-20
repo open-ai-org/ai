@@ -10,8 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unsafe"
-
 	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/mongoose"
 	"github.com/open-ai-org/tokenizer"
@@ -264,12 +262,26 @@ func cmdChat(modelArg string) {
 		os.Exit(1)
 	}
 
-	_ = unsafe.Pointer(nil) // keep import
-
 	// Chat REPL
 	modelBase := filepath.Base(path)
+
 	fmt.Printf("ai chat — %s (%s)\n", modelBase, eng.Name())
 	fmt.Printf("Type your message. Press Ctrl+D to exit.\n\n")
+
+	// Resolve stop token IDs once
+	stopTokens := map[int]bool{0: true}
+	if tok.EOS > 0 {
+		stopTokens[tok.EOS] = true
+	}
+	for _, s := range []string{"<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>"} {
+		if tok.HasToken(s) {
+			stopTokens[tok.Vocab[s]] = true
+		}
+		ids := tok.Encode(s)
+		if len(ids) == 1 {
+			stopTokens[ids[0]] = true
+		}
+	}
 
 	history := []chatMessage{
 		{Role: "system", Content: "You are a helpful assistant."},
@@ -327,23 +339,42 @@ func cmdChat(modelArg string) {
 		var genTokens []int
 		var response strings.Builder
 
+		lastPrint := 0
 		t0 := time.Now()
 		for step := 0; step < maxTokens; step++ {
 			nextToken := sampleTopK(logits, temp, topK)
 			allTokens = append(allTokens, nextToken)
 			genTokens = append(genTokens, nextToken)
 
-			// Check for stop tokens
-			if nextToken == tok.EOS || nextToken == 0 {
-				break
-			}
-			// ChatML end token
-			text := tok.Decode([]int{nextToken})
-			if strings.Contains(text, "<|im_end|>") || strings.Contains(text, "<|eot_id|>") {
+			if stopTokens[nextToken] {
 				break
 			}
 
-			fmt.Print(text)
+			if nextToken >= 151643 {
+				break
+			}
+			text := tok.Decode([]int{nextToken})
+			response.WriteString(text)
+			// Check accumulated response for spelled-out special tokens
+			r := response.String()
+			if idx := strings.Index(r, "<|im_end|>"); idx >= 0 {
+				fmt.Print(r[lastPrint:idx])
+				break
+			}
+			if idx := strings.Index(r, "<|endoftext|>"); idx >= 0 {
+				fmt.Print(r[lastPrint:idx])
+				break
+			}
+			if idx := strings.Index(r, "<|eot_id|>"); idx >= 0 {
+				fmt.Print(r[lastPrint:idx])
+				break
+			}
+			// Print up to a safe point (hold back last 15 chars in case a special token is forming)
+			safeLen := len(r) - 15
+			if safeLen > lastPrint {
+				fmt.Print(r[lastPrint:safeLen])
+				lastPrint = safeLen
+			}
 			response.WriteString(text)
 
 			pos := len(allTokens) - 1
@@ -356,10 +387,28 @@ func cmdChat(modelArg string) {
 			}
 		}
 
+		// Flush any remaining buffered text
+		r := response.String()
+		if lastPrint < len(r) {
+			// Don't print past any special token
+			remaining := r[lastPrint:]
+			if idx := strings.Index(remaining, "<|"); idx >= 0 {
+				remaining = remaining[:idx]
+			}
+			fmt.Print(remaining)
+		}
+
 		elapsed := time.Since(t0)
 		nGen := len(genTokens)
 		fmt.Printf("\n\n[%d tokens, %.1f tok/s]\n\n", nGen, float64(nGen)/elapsed.Seconds())
 
-		history = append(history, chatMessage{Role: "assistant", Content: response.String()})
+		// Strip special tokens from history
+		cleanResponse := r
+		for _, sp := range []string{"<|im_end|>", "<|endoftext|>", "<|eot_id|>"} {
+			if idx := strings.Index(cleanResponse, sp); idx >= 0 {
+				cleanResponse = cleanResponse[:idx]
+			}
+		}
+		history = append(history, chatMessage{Role: "assistant", Content: strings.TrimSpace(cleanResponse)})
 	}
 }
