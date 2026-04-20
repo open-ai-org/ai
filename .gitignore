@@ -1,0 +1,10 @@
+# Binary
+ai
+tesseract
+
+
+# Test logs
+*.log
+
+# OS
+.DS_Store

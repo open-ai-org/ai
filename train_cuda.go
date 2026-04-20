@@ -266,6 +266,118 @@ func cmdTrainCUDA() {
 
 	var batchReady chan struct{}
 	curStart := start0
+	// Sparse immune checkpoint: save/restore 49 hot rows on loss floor/rebound
+	type sparseCheckpoint struct {
+		rows    []int32              // hot row indices at checkpoint time
+		weights map[string][]float32 // "layer.proj" → saved row data
+		loss    float32
+		step    int
+	}
+	var ckpt *sparseCheckpoint
+	bestFloor := float32(1e30)
+	immuneActive := false
+	floorContactStep := 0
+	floorWindow := 10
+	maxRecoveries := 20
+	recoveryCount := 0
+
+	saveHotRows := func(hotRows []int32, loss float32, step int) {
+		ckpt = &sparseCheckpoint{
+			rows:    make([]int32, len(hotRows)),
+			weights: make(map[string][]float32),
+			loss:    loss,
+			step:    step,
+		}
+		copy(ckpt.rows, hotRows)
+		cuda.Sync()
+		for li := range lays {
+			for _, proj := range []struct{ name string; w *mongoose.Tensor }{
+				{"wq", lays[li].wq}, {"wk", lays[li].wk}, {"wv", lays[li].wv},
+				{"wo", lays[li].wo}, {"gate", lays[li].gate}, {"up", lays[li].up},
+				{"down", lays[li].down},
+			} {
+				wH := te.ToHost(proj.w)
+				cols := proj.w.Size / (proj.w.Shape[0])
+				key := fmt.Sprintf("%d.%s", li, proj.name)
+				saved := make([]float32, 0, len(hotRows)*cols)
+				for _, r := range hotRows {
+					row := int(r)
+					if row >= 0 && row < proj.w.Shape[0] {
+						saved = append(saved, wH[row*cols:(row+1)*cols]...)
+					}
+				}
+				ckpt.weights[key] = saved
+			}
+		}
+	}
+
+	restoreHotRows := func() {
+		if ckpt == nil { return }
+		for li := range lays {
+			for _, proj := range []struct{ name string; w *mongoose.Tensor }{
+				{"wq", lays[li].wq}, {"wk", lays[li].wk}, {"wv", lays[li].wv},
+				{"wo", lays[li].wo}, {"gate", lays[li].gate}, {"up", lays[li].up},
+				{"down", lays[li].down},
+			} {
+				key := fmt.Sprintf("%d.%s", li, proj.name)
+				saved := ckpt.weights[key]
+				if len(saved) == 0 { continue }
+				wH := te.ToHost(proj.w)
+				cols := proj.w.Size / (proj.w.Shape[0])
+				idx := 0
+				for _, r := range ckpt.rows {
+					row := int(r)
+					if row >= 0 && row < proj.w.Shape[0] && idx+cols <= len(saved) {
+						copy(wH[row*cols:(row+1)*cols], saved[idx:idx+cols])
+						idx += cols
+					}
+				}
+				cuda.UploadInto(proj.w, wH)
+			}
+		}
+	}
+
+	// Helix-pattern disk checkpoints: save on new best loss, 88-step cooldown
+	ckptDir := filepath.Join(os.TempDir(), "ai-train-out", "checkpoints")
+	if GlobalOutDir != "" {
+		ckptDir = filepath.Join(GlobalOutDir, "checkpoints")
+	}
+	os.MkdirAll(ckptDir, 0755)
+	lastCkptStep := 0
+	ckptBestLoss := float32(999.0)
+	ckptCooldown := 88 // double helix
+
+	saveFullCheckpoint := func(step int, loss float32) {
+		cuda.Sync()
+		tensors := map[string]gguf.SaveTensor{
+			"model.embed_tokens.weight": {Data: te.ToHost(embed), Shape: []int{vocabSize, dim}},
+			"model.norm.weight":         {Data: te.ToHost(finalNorm), Shape: []int{dim}},
+		}
+		for li := range lays {
+			pfx := fmt.Sprintf("model.layers.%d.", li)
+			tensors[pfx+"self_attn.q_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wq), Shape: []int{dim, dim}}
+			tensors[pfx+"self_attn.k_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wk), Shape: []int{kvDim, dim}}
+			tensors[pfx+"self_attn.v_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wv), Shape: []int{kvDim, dim}}
+			tensors[pfx+"self_attn.o_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wo), Shape: []int{dim, dim}}
+			tensors[pfx+"mlp.gate_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].gate), Shape: []int{ffnDim, dim}}
+			tensors[pfx+"mlp.up_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].up), Shape: []int{ffnDim, dim}}
+			tensors[pfx+"mlp.down_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].down), Shape: []int{dim, ffnDim}}
+			tensors[pfx+"input_layernorm.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].norm1), Shape: []int{dim}}
+			tensors[pfx+"post_attention_layernorm.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].norm2), Shape: []int{dim}}
+		}
+		stepDir := filepath.Join(ckptDir, fmt.Sprintf("step-%05d", step))
+		os.MkdirAll(stepDir, 0755)
+		stPath := filepath.Join(stepDir, "model.safetensors")
+		if err := gguf.SaveSafeTensors(stPath, tensors); err != nil {
+			log.Printf("[checkpoint] save error: %v", err)
+		} else {
+			cfgJSON := fmt.Sprintf(`{"architectures":["LlamaForCausalLM"],"hidden_size":%d,"num_hidden_layers":%d,"num_attention_heads":%d,"num_key_value_heads":%d,"intermediate_size":%d,"vocab_size":%d,"max_position_embeddings":2048,"rope_theta":10000.0,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":true}`,
+				dim, nLayers, heads, kvHeads, ffnDim, vocabSize)
+			os.WriteFile(filepath.Join(stepDir, "config.json"), []byte(cfgJSON), 0644)
+			log.Printf("[checkpoint] immune: new best %.3f at step %d → %s", loss, step, stepDir)
+		}
+	}
+
 	var prevLoss float32
 	for step := 1; step <= *stepsFlag; step++ {
 		// Wait for L3 prep goroutine from previous step
@@ -434,26 +546,71 @@ func cmdTrainCUDA() {
 			}
 		}
 
-		// === HELIX DNA optimizer with immune response ===
+		// === Sparse immune system ===
+		hotRows := conductor.HotRows()
+
+		// Checkpoint when loss improves near floor
+		if !immuneActive && step > 1 && stepLoss > 0 {
+			if stepLoss < bestFloor*1.1 {
+				saveHotRows(hotRows, stepLoss, step)
+			}
+		}
+
+		// Floor detection
+		if stepLoss > 0 && stepLoss < bestFloor {
+			bestFloor = stepLoss
+			if !immuneActive {
+				immuneActive = true
+				floorContactStep = step
+				recoveryCount = 0
+			}
+		}
+
+		// Helix-pattern disk checkpoint: new best loss + 88-step cooldown
+		if stepLoss < ckptBestLoss && step-lastCkptStep >= ckptCooldown && step > 1 {
+			ckptBestLoss = stepLoss
+			lastCkptStep = step
+			go saveFullCheckpoint(step, stepLoss)
+		}
+
+		// Immune monitoring: rebound detection
+		immuneSkip := false
+		if immuneActive && step-floorContactStep >= floorWindow {
+			rebound := stepLoss - bestFloor
+			threshold := bestFloor * 0.05
+			if rebound > threshold && recoveryCount < maxRecoveries && ckpt != nil {
+				restoreHotRows()
+				recoveryCount++
+				immuneActive = false
+				immuneSkip = true
+				if step <= 3 || step%*logEvery == 0 || true {
+					elapsed := time.Since(t0)
+					fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s) [IMMUNE → floor %.3f]\n",
+						step, *stepsFlag, stepLoss, getLR(step), elapsed.Seconds(),
+						float64(step)/elapsed.Seconds(), ckpt.loss)
+				}
+			} else {
+				immuneActive = false
+			}
+		}
+
+		// === HELIX DNA optimizer ===
 		stepLR := getLR(step)
-		r, _, _, rewound := hlx.PrepareStep(step, stepLoss, stepLR)
+		r, _, _, _ := hlx.PrepareStep(step, stepLoss, stepLR)
+
 		// Signal-driven LR scaling: dampen when loss rebounds
 		if step > 1 && prevLoss > 0 {
 			dLoss := float64(stepLoss) - float64(prevLoss)
 			if dLoss > 0 {
 				ratio := float32(dLoss / math.Max(float64(prevLoss), 1e-6))
 				if ratio > 1.0 { ratio = 1.0 }
-				stepLR *= (1.0 - ratio) // scale down LR proportional to rebound
+				stepLR *= (1.0 - ratio)
 			}
 		}
 		prevLoss = stepLoss
 		curLR = stepLR
-		if rewound {
-			if step <= 3 || step%*logEvery == 0 {
-				elapsed := time.Since(t0)
-				fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s) [REWIND]\n",
-					step, *stepsFlag, stepLoss, stepLR, elapsed.Seconds(), float64(step)/elapsed.Seconds())
-			}
+
+		if immuneSkip {
 			continue
 		}
 
@@ -513,40 +670,10 @@ func cmdTrainCUDA() {
 
 	cuda.Sync()
 	total := time.Since(t0)
-	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)\n", *stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds())
+	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)  floor=%.3f\n",
+		*stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds(), bestFloor)
 
-	// Save model
-	saveDir := filepath.Join(os.TempDir(), "ai-train-out")
-	if GlobalOutDir != "" {
-		saveDir = GlobalOutDir
-	}
-	os.MkdirAll(saveDir, 0755)
-
-	tensors := map[string]gguf.SaveTensor{
-		"model.embed_tokens.weight": {Data: te.ToHost(embed), Shape: []int{vocabSize, dim}},
-		"model.norm.weight":         {Data: te.ToHost(finalNorm), Shape: []int{dim}},
-	}
-	for li := range lays {
-		pfx := fmt.Sprintf("model.layers.%d.", li)
-		tensors[pfx+"self_attn.q_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wq), Shape: []int{dim, dim}}
-		tensors[pfx+"self_attn.k_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wk), Shape: []int{kvDim, dim}}
-		tensors[pfx+"self_attn.v_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wv), Shape: []int{kvDim, dim}}
-		tensors[pfx+"self_attn.o_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wo), Shape: []int{dim, dim}}
-		tensors[pfx+"mlp.gate_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].gate), Shape: []int{ffnDim, dim}}
-		tensors[pfx+"mlp.up_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].up), Shape: []int{ffnDim, dim}}
-		tensors[pfx+"mlp.down_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].down), Shape: []int{dim, ffnDim}}
-		tensors[pfx+"input_layernorm.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].norm1), Shape: []int{dim}}
-		tensors[pfx+"post_attention_layernorm.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].norm2), Shape: []int{dim}}
-	}
-
-	stPath := filepath.Join(saveDir, "model.safetensors")
-	if err := gguf.SaveSafeTensors(stPath, tensors); err != nil {
-		log.Printf("[save] error: %v", err)
-	} else {
-		// Write config.json
-		cfgJSON := fmt.Sprintf(`{"architectures":["LlamaForCausalLM"],"hidden_size":%d,"num_hidden_layers":%d,"num_attention_heads":%d,"num_key_value_heads":%d,"intermediate_size":%d,"vocab_size":%d,"max_position_embeddings":2048,"rope_theta":10000.0,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":true}`,
-			dim, nLayers, heads, kvHeads, ffnDim, vocabSize)
-		os.WriteFile(filepath.Join(saveDir, "config.json"), []byte(cfgJSON), 0644)
-		fmt.Printf("Model saved to %s\n", saveDir)
-	}
+	// Final save
+	saveFullCheckpoint(*stepsFlag, bestFloor)
+	fmt.Printf("floor: %.3f at best\n", bestFloor)
 }

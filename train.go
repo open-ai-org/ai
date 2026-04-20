@@ -163,6 +163,7 @@ func cmdTrain() {
 	fmt.Println("Training...")
 	t0 := time.Now()
 
+	var prevLoss float32
 	for step := 1; step <= *stepsFlag; step++ {
 		start := rng.Intn(len(data) - n - 1)
 
@@ -174,6 +175,19 @@ func cmdTrain() {
 		}
 
 		loss := graph.GraphTrainStepAdam(tokens, targets, lr)
+
+		// Signal-driven LR dampening for next step
+		if step > 1 && prevLoss > 0 {
+			dLoss := float64(loss) - float64(prevLoss)
+			if dLoss > 0 {
+				ratio := float32(dLoss / math.Max(float64(prevLoss), 1e-6))
+				if ratio > 1.0 { ratio = 1.0 }
+				lr = float32(*lrFlag) * (1.0 - ratio)
+			} else {
+				lr = float32(*lrFlag)
+			}
+		}
+		prevLoss = loss
 
 		if step%*logEvery == 0 || step == 1 {
 			graph.Sync()

@@ -82,6 +82,13 @@ func main() {
 			os.Exit(1)
 		}
 		cmdExport(os.Args[2:])
+	case "chat":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: ai chat <model>")
+			os.Exit(1)
+		}
+		cmdChat(os.Args[2])
+
 	// Hidden aliases for backwards compat
 	case "train-cuda":
 		cmdTrainCUDA()
@@ -125,6 +132,7 @@ func usage() {
 	fmt.Println("  ai eval model=<name> data=<file>           Validation pass (loss + perplexity)")
 	fmt.Println()
 	fmt.Println("Inference:")
+	fmt.Println("  ai chat <model>                            Interactive chat")
 	fmt.Println("  ai infer <model> \"prompt\"                  Generate text")
 	fmt.Println("  ai serve <model>                           OpenAI-compatible API")
 	fmt.Println()

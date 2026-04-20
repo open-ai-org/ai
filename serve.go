@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -215,9 +216,12 @@ type serveState struct {
 	// GPU engine (nil if CPU-only)
 	eng mongoose.Engine
 
-	// TODO: Add loaded weight tensors (GPU-resident or streaming)
-	// TODO: Add KV cache pool for concurrent requests
-	// TODO: Add inference pipeline (forward pass function)
+	// Inference pipeline
+	fwd       func(tokenID, pos int) []float32
+	embedData []float32
+	cosTab    []float32
+	sinTab    []float32
+	halfHead  int
 }
 
 // -----------------------------------------------------------------------
@@ -343,21 +347,82 @@ func (s *serveState) loadModel(name string) error {
 	s.safetens = st
 
 	// Init GPU
-	cuda := mongoose.NewCUDA()
-	if cuda != nil {
-		s.eng = cuda
-		s.eng = cuda
-		mongoose.LoadKernels()
-		log.Printf("[serve] GPU: %s", cuda.Name())
-	} else {
-		log.Printf("[serve] no CUDA GPU detected, running on CPU")
+	s.eng = selectEngine("auto")
+	mongoose.LoadKernels()
+	log.Printf("[serve] engine: %s", s.eng.Name())
+
+	// Load embeddings
+	embedData, _, _ := st.ReadTensorFloat32("model.embed_tokens.weight")
+	var lmHeadData []float32
+	lmHeadData, _, err = st.ReadTensorFloat32("lm_head.weight")
+	if err != nil {
+		lmHeadData = embedData
+	}
+	s.embedData = embedData
+
+	headDim := s.dim / s.heads
+	s.halfHead = headDim / 2
+	ropeTheta := float32(10000.0)
+	if v, ok := cfg["rope_theta"].(float64); ok {
+		ropeTheta = float32(v)
 	}
 
-	// TODO: Load model weights to GPU (GPU-resident mode if VRAM sufficient)
-	// TODO: Pre-allocate KV cache slots for max concurrent requests
-	// TODO: Precompute RoPE cos/sin tables on GPU
-	// TODO: Support GGUF models in addition to safetensors
-	// TODO: Support AWQ/GPTQ quantized models (DequantAWQ already exists)
+	// RoPE tables
+	s.cosTab = make([]float32, s.maxSeq*s.halfHead)
+	s.sinTab = make([]float32, s.maxSeq*s.halfHead)
+	for pos := 0; pos < s.maxSeq; pos++ {
+		for j := 0; j < s.halfHead; j++ {
+			freq := 1.0 / math.Pow(float64(ropeTheta), float64(2*j)/float64(headDim))
+			angle := float64(pos) * freq
+			s.cosTab[pos*s.halfHead+j] = float32(math.Cos(angle))
+			s.sinTab[pos*s.halfHead+j] = float32(math.Sin(angle))
+		}
+	}
+
+	// Set up forward pass using cmdInferGPU's Metal fused path or CPU fallback
+	if metal, ok := s.eng.(*mongoose.Metal); ok {
+		ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq)
+		if ret == 0 {
+			wi := 0
+			kvDim := s.kvHeads * headDim
+			for l := 0; l < s.layers; l++ {
+				prefix := fmt.Sprintf("model.layers.%d.", l)
+				loadW := func(n string) { d, _, _ := st.ReadTensorFloat32(prefix + n); if d != nil { metal.FusedSetWeight(wi, d) }; wi++ }
+				loadB := func(n string, sz int) { d, _, _ := st.ReadTensorFloat32(prefix + n); if d == nil { d = make([]float32, sz) }; metal.FusedSetWeight(wi, d); wi++ }
+				loadW("input_layernorm.weight")
+				loadW("self_attn.q_proj.weight"); loadW("self_attn.k_proj.weight"); loadW("self_attn.v_proj.weight")
+				loadB("self_attn.q_proj.bias", s.dim); loadB("self_attn.k_proj.bias", kvDim); loadB("self_attn.v_proj.bias", kvDim)
+				loadW("self_attn.o_proj.weight"); loadW("post_attention_layernorm.weight")
+				loadW("mlp.gate_proj.weight"); loadW("mlp.up_proj.weight"); loadW("mlp.down_proj.weight")
+			}
+			fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+			metal.FusedSetWeight(wi, fnorm); wi++
+			metal.FusedSetWeight(wi, lmHeadData); wi++
+
+			fHidden := make([]float32, s.dim)
+			fLogits := make([]float32, s.vocabSize)
+			s.fwd = func(tokenID, pos int) []float32 {
+				tokOff := tokenID * s.dim
+				if tokOff+s.dim > len(s.embedData) { return nil }
+				copy(fHidden, s.embedData[tokOff:tokOff+s.dim])
+				metal.FusedStep(fHidden, s.cosTab[pos*s.halfHead:pos*s.halfHead+s.halfHead],
+					s.sinTab[pos*s.halfHead:pos*s.halfHead+s.halfHead], pos, fLogits)
+				return fLogits
+			}
+			log.Printf("[serve] Metal fused inference ready (%d weights)", wi)
+		}
+	}
+
+	// CPU fallback if no GPU path
+	if s.fwd == nil {
+		log.Printf("[serve] using CPU inference fallback")
+		s.fwd = func(tokenID, pos int) []float32 {
+			tokOff := tokenID * s.dim
+			if tokOff+s.dim > len(s.embedData) { return nil }
+			// Stub — returns nil to signal unimplemented
+			return nil
+		}
+	}
 
 	return nil
 }
@@ -413,18 +478,50 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Non-streaming response
-	// TODO: Run inference forward pass:
-	//   1. Embed prompt tokens (lookup or GPU gather)
-	//   2. For each layer: RMSNorm → QKV → RoPE → attention → residual → FFN → residual
-	//   3. Final RMSNorm → lm_head matmul → logits
-	//   4. Sample from logits (temperature, top-p, top-k)
-	//   5. Repeat until maxTokens or EOS
-	//   6. Decode generated token IDs back to text
+	// Non-streaming response: run forward pass
+	s.mu.RLock()
+	fwd := s.fwd
+	s.mu.RUnlock()
 
-	// Stub: return a placeholder response indicating inference is not yet wired
-	generated := "[mongoose] inference not yet wired — model loaded, tokenizer working, GPU ready"
-	completionTokens := len(tok.Encode(generated))
+	temp := float32(0.7)
+	if req.Temperature != nil {
+		temp = float32(*req.Temperature)
+	}
+	topK := 40
+
+	// Prefill
+	var logits []float32
+	for i, tid := range promptTokens {
+		logits = fwd(tid, i)
+	}
+	if logits == nil {
+		writeError(w, http.StatusInternalServerError, "inference failed — no GPU forward pass available", "server_error")
+		return
+	}
+
+	// Generate
+	allTokens := make([]int, len(promptTokens))
+	copy(allTokens, promptTokens)
+	var genTokens []int
+	for step := 0; step < maxTokens; step++ {
+		nextToken := sampleTopK(logits, temp, topK)
+		allTokens = append(allTokens, nextToken)
+		genTokens = append(genTokens, nextToken)
+		if nextToken == tok.EOS || nextToken == 0 {
+			break
+		}
+		pos := len(allTokens) - 1
+		if pos >= s.maxSeq-1 {
+			break
+		}
+		logits = fwd(allTokens[pos], pos)
+		if logits == nil {
+			break
+		}
+	}
+
+	generated := tok.Decode(genTokens)
+	completionTokens := len(genTokens)
 
 	resp := ChatCompletionResponse{
 		ID:      generateID("chatcmpl"),
@@ -481,28 +578,61 @@ func (s *serveState) handleChatStream(w http.ResponseWriter, req ChatCompletionR
 		},
 	})
 
-	// TODO: Token-by-token generation loop:
-	//   1. Run forward pass for one token
-	//   2. Sample next token from logits
-	//   3. Decode token to text
-	//   4. Send as SSE chunk with delta.content
-	//   5. Check for EOS or maxTokens
-	//   6. Update KV cache for next position
-	//
-	// For now, send a single content chunk as placeholder.
+	s.mu.RLock()
+	fwd := s.fwd
+	tok := s.tokenizer
+	s.mu.RUnlock()
 
-	writeSSEChunk(w, flusher, ChatCompletionChunk{
-		ID:      id,
-		Object:  "chat.completion.chunk",
-		Created: now,
-		Model:   s.modelName,
-		Choices: []ChatChunkChoice{
-			{
-				Index: 0,
-				Delta: ChatDelta{Content: "[mongoose] streaming inference stub"},
+	temp := float32(0.7)
+	if req.Temperature != nil {
+		temp = float32(*req.Temperature)
+	}
+	topK := 40
+
+	// Prefill
+	var logits []float32
+	for i, tid := range promptTokens {
+		logits = fwd(tid, i)
+	}
+	if logits == nil {
+		writeSSEChunk(w, flusher, ChatCompletionChunk{
+			ID: id, Object: "chat.completion.chunk", Created: now, Model: s.modelName,
+			Choices: []ChatChunkChoice{{Index: 0, Delta: ChatDelta{Content: "[error: no GPU forward pass]"}}},
+		})
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
+	// Generate token by token, streaming each
+	allTokens := make([]int, len(promptTokens))
+	copy(allTokens, promptTokens)
+	for step := 0; step < maxTokens; step++ {
+		nextToken := sampleTopK(logits, temp, topK)
+		allTokens = append(allTokens, nextToken)
+		if nextToken == tok.EOS || nextToken == 0 {
+			break
+		}
+		text := tok.Decode([]int{nextToken})
+		writeSSEChunk(w, flusher, ChatCompletionChunk{
+			ID:      id,
+			Object:  "chat.completion.chunk",
+			Created: now,
+			Model:   s.modelName,
+			Choices: []ChatChunkChoice{
+				{Index: 0, Delta: ChatDelta{Content: text}},
 			},
-		},
-	})
+		})
+
+		pos := len(allTokens) - 1
+		if pos >= s.maxSeq-1 {
+			break
+		}
+		logits = fwd(allTokens[pos], pos)
+		if logits == nil {
+			break
+		}
+	}
 
 	// Final chunk: finish_reason
 	stop := "stop"

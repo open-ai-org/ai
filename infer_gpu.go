@@ -358,20 +358,28 @@ func cmdInferGPU(model string, promptParts []string) {
 		return logits
 	}
 
-	// === CUDA Q8 fused path ===
+	// === CUDA Q8/Q4 fused path ===
 	gpuForwardQ8 := func(tokenID, pos int) []float32 { return nil }
 	useCUDAQ8 := false
+	cudaUseQ4 := false
 
 	if cuda, ok := eng.(*mongoose.CUDA); ok && mongoose.HasQ8Matvec() && mongoose.KernelsLoaded() {
 		_ = cuda
+
+		nParams := int64(vocabSize)*int64(dim)*2 // embed + lmHead
+		for l := 0; l < nLayers; l++ {
+			nParams += int64(dim)*int64(dim)*2 + int64(kvDim)*int64(dim)*2 + int64(ffnDim)*int64(dim)*3
+		}
+		cudaUseQ4 = mongoose.HasQ4Matvec() && nParams > 4_000_000_000
+
 		type q8Weight struct {
-			data   unsafe.Pointer // int8 on GPU [rows*cols bytes]
+			data   unsafe.Pointer // int8 or packed uint8 on GPU
 			scales unsafe.Pointer // float32 on GPU [rows floats]
 			rows   int
 			cols   int
+			q4     bool
 		}
 		quantizeToGPU := func(fp32 []float32, rows, cols int) q8Weight {
-			q := make([]int8, rows*cols)
 			s := make([]float32, rows)
 			for r := 0; r < rows; r++ {
 				var absMax float32
@@ -385,9 +393,50 @@ func cmdInferGPU(model string, promptParts []string) {
 					}
 				}
 				s[r] = absMax
+			}
+
+			if cudaUseQ4 {
+				packed := make([]byte, rows*cols/2)
+				for r := 0; r < rows; r++ {
+					invScale := float32(0)
+					if s[r] > 0 {
+						invScale = 7.0 / s[r]
+					}
+					for c := 0; c < cols; c += 2 {
+						v0 := fp32[r*cols+c] * invScale
+						v1 := float32(0)
+						if c+1 < cols {
+							v1 = fp32[r*cols+c+1] * invScale
+						}
+						q0 := int(v0+0.5) + 8
+						q1 := int(v1+0.5) + 8
+						if v0 < 0 {
+							q0 = int(v0-0.5) + 8
+						}
+						if v1 < 0 {
+							q1 = int(v1-0.5) + 8
+						}
+						if q0 < 0 { q0 = 0 }
+						if q0 > 15 { q0 = 15 }
+						if q1 < 0 { q1 = 0 }
+						if q1 > 15 { q1 = 15 }
+						packed[r*(cols/2)+c/2] = byte(q0 | (q1 << 4))
+					}
+				}
+				nBytes := len(packed)
+				nFloats := (nBytes + 3) / 4
+				buf := make([]float32, nFloats)
+				copy((*[1 << 30]byte)(unsafe.Pointer(&buf[0]))[:nBytes], packed)
+				tData := te.FromHost(buf, []int{1, nFloats})
+				tScales := te.FromHost(s, []int{1, rows})
+				return q8Weight{data: tData.DevicePtr(), scales: tScales.DevicePtr(), rows: rows, cols: cols, q4: true}
+			}
+
+			q := make([]int8, rows*cols)
+			for r := 0; r < rows; r++ {
 				invScale := float32(0)
-				if absMax > 0 {
-					invScale = 127.0 / absMax
+				if s[r] > 0 {
+					invScale = 127.0 / s[r]
 				}
 				for c := 0; c < cols; c++ {
 					v := fp32[r*cols+c] * invScale
@@ -400,14 +449,13 @@ func cmdInferGPU(model string, promptParts []string) {
 					q[r*cols+c] = int8(v)
 				}
 			}
-			// Pack int8 data into float32 slice for upload via FromHost
 			nBytes := rows * cols
 			nFloats := (nBytes + 3) / 4
-			packed := make([]float32, nFloats)
-			copy((*[1 << 30]byte)(unsafe.Pointer(&packed[0]))[:nBytes], (*[1 << 30]byte)(unsafe.Pointer(&q[0]))[:nBytes])
-			tData := te.FromHost(packed, []int{1, nFloats})
+			buf := make([]float32, nFloats)
+			copy((*[1 << 30]byte)(unsafe.Pointer(&buf[0]))[:nBytes], (*[1 << 30]byte)(unsafe.Pointer(&q[0]))[:nBytes])
+			tData := te.FromHost(buf, []int{1, nFloats})
 			tScales := te.FromHost(s, []int{1, rows})
-			return q8Weight{data: tData.DevicePtr(), scales: tScales.DevicePtr(), rows: rows, cols: cols}
+			return q8Weight{data: tData.DevicePtr(), scales: tScales.DevicePtr(), rows: rows, cols: cols, q4: false}
 		}
 
 		type q8Layer struct {
@@ -417,7 +465,11 @@ func cmdInferGPU(model string, promptParts []string) {
 			gnorm1, gnorm2     *mongoose.Tensor
 		}
 
-		fmt.Print("Quantizing weights to Q8... ")
+		qLabel := "Q8"
+		if cudaUseQ4 {
+			qLabel = "Q4"
+		}
+		fmt.Printf("Quantizing weights to %s (%.1fB params)... ", qLabel, float64(nParams)/1e9)
 		q8Layers := make([]q8Layer, nLayers)
 		for l := 0; l < nLayers; l++ {
 			gl := &gpuLayers[l]
@@ -447,7 +499,11 @@ func cmdInferGPU(model string, promptParts []string) {
 		useCUDAQ8 = true
 
 		q8MV := func(actPtr unsafe.Pointer, w q8Weight, outPtr unsafe.Pointer) {
-			mongoose.KQ8Matvec(actPtr, w.data, w.scales, outPtr, w.rows, w.cols)
+			if w.q4 {
+				mongoose.KQ4Matvec(actPtr, w.data, w.scales, outPtr, w.rows, w.cols)
+			} else {
+				mongoose.KQ8Matvec(actPtr, w.data, w.scales, outPtr, w.rows, w.cols)
+			}
 		}
 
 		gpuForwardQ8 = func(tokenID, pos int) []float32 {
@@ -967,7 +1023,11 @@ func cmdInferGPU(model string, promptParts []string) {
 		fwd = fusedForward
 	} else if useCUDAQ8 {
 		fwd = gpuForwardQ8
-		fmt.Println("  infer: CUDA Q8 fused matvec")
+		if cudaUseQ4 {
+			fmt.Println("  infer: CUDA Q4 fused matvec")
+		} else {
+			fmt.Println("  infer: CUDA Q8 fused matvec")
+		}
 	} else if useMetalGraph {
 		fwd = metalForward
 	} else if useGPUKernels && gpuResident {
