@@ -60,6 +60,14 @@ func main() {
 		cmdInferGPU(os.Args[2], os.Args[3:])
 	case "quantize":
 		cmdQuantize()
+	case "prune":
+		cmdPrune()
+	case "distill":
+		cmdDistill(args)
+	case "sweep":
+		cmdSweep(args)
+	case "explain":
+		cmdExplain()
 	case "serve":
 		cmdServe()
 	case "bench":

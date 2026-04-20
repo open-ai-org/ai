@@ -34,13 +34,19 @@ cp gemm_metal4.metallib ../../ai/
 
 ```bash
 ai pull Qwen/Qwen2.5-0.5B          # download from HuggingFace
+ai chat Qwen2.5-0.5B               # interactive chat
 ai infer Qwen2.5-0.5B "Hello"      # generate text
 ai serve Qwen2.5-0.5B              # OpenAI-compatible API
-ai quantize Qwen2.5-0.5B q8        # quantize to INT8 GGUF
-ai convert gguf Qwen2.5-0.5B       # convert to GGUF for Ollama
 ai train data=corpus.txt            # train from scratch
-ai bench                            # raw GPU benchmark
-ai gpus                             # detect and calibrate GPUs
+ai finetune model=Qwen2.5-0.5B data=corpus.txt
+ai resume checkpoint=./checkpoints  # continue training
+ai quantize Qwen2.5-0.5B q8        # quantize to INT8 GGUF
+ai prune Qwen2.5-0.5B              # remove 50% of weights
+ai explain Qwen2.5-0.5B "prompt"   # token attribution
+ai sweep data=corpus.txt            # hyperparameter search
+ai distill teacher=7B data=corpus.txt  # knowledge distillation
+ai dataset inspect corpus.txt       # dataset statistics
+ai dataset split corpus.txt         # train/val/test split
 ```
 
 ## Architecture
@@ -52,19 +58,26 @@ ai gpus                             # detect and calibrate GPUs
   - GPU-resident tier 2: cuBLAS/MPS matmul + CPU attention
   - CPU streaming tier 3: pure Go fallback
 - `infer.go` — CPU-only text generation
+- `chat.go` — interactive chat REPL with ChatML/Llama3 template detection
 - `serve.go` — OpenAI-compatible API server (chat, completions, embeddings)
-- `train_unified.go` — unified training entry point
+- `train_unified.go` — unified training entry point (dispatches to backend)
 - `train_cuda.go` — CUDA training with helix optimizer
 - `train_finetune.go` — fine-tuning pretrained models
+- `train.go` — GraphTrainEngine training + `resume` from checkpoint
 - `commands.go` — pull, models, info, bench, gpus, convert, export
 - `quantize.go` — quantize safetensors to GGUF (Q8_0, Q4_0, F16, F32)
+- `prune.go` — magnitude pruning (unstructured + structured/head pruning)
+- `explain.go` — token attribution via embedding perturbation
+- `sweep.go` — hyperparameter search (grid/random over lr, dim, layers)
+- `distill.go` — knowledge distillation (teacher→student KL divergence)
+- `dataset.go` — dataset inspection, split (train/val/test), augmentation
 - `globals.go` — shared config, engine selection (`selectEngine`)
 - `autodetect.go` — hardware detection and model profiling
-- `checkpoint.go` — save/resume training state
+- `checkpoint.go` — checkpoint management (list, diff, meta.json)
 - `merge.go` — merge LoRA adapters into base model
 - `benchmark.go` — model inference profiling
-- `dataset.go` — dataset loading and inspection
 - `eval.go` — validation (loss + perplexity)
+- `profile.go` — per-op GPU timing breakdown
 
 ## Inference Tier Selection
 

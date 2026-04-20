@@ -24,6 +24,9 @@ go build -o ai .
 # Download a model
 ai pull Qwen/Qwen2.5-0.5B
 
+# Chat
+ai chat Qwen2.5-0.5B
+
 # Generate text
 ai infer Qwen2.5-0.5B "The meaning of life is"
 
@@ -33,20 +36,64 @@ ai serve Qwen2.5-0.5B
 
 ## Commands
 
+### Training
 | Command | Description |
 |---------|-------------|
+| `ai train data=<file>` | Train from scratch |
+| `ai finetune model=<name> data=<file>` | Fine-tune pretrained model |
+| `ai resume` | Continue training from checkpoint |
+
+### Evaluation & Inference
+| Command | Description |
+|---------|-------------|
+| `ai chat <model>` | Interactive chat |
 | `ai infer <model> "prompt"` | Generate text |
+| `ai eval model=<name> data=<file>` | Validation pass (loss + perplexity) |
+| `ai benchmark <model>` | Inference throughput and latency |
+
+### Optimization
+| Command | Description |
+|---------|-------------|
+| `ai quantize <model> [q8\|q4\|f16]` | Reduce precision |
+| `ai prune <model>` | Remove low-magnitude weights (50% default) |
+| `ai prune <model> --sparsity 0.7 --structured` | Structured head pruning |
+| `ai convert gguf <model>` | Export to GGUF (for Ollama) |
+| `ai merge <base> <adapters>` | Merge LoRA into base model |
+
+### Data
+| Command | Description |
+|---------|-------------|
+| `ai dataset inspect <file>` | Dataset statistics and recommendations |
+| `ai dataset split <file>` | Partition into train/val/test |
+| `ai dataset augment <file>` | Dedup, lowercase, repeat, shuffle |
+
+### Tuning & Search
+| Command | Description |
+|---------|-------------|
+| `ai sweep data=<file> lr=1e-4,3e-4,6e-4` | Hyperparameter search |
+| `ai distill teacher=<model> data=<file>` | Knowledge distillation |
+| `ai profile` | Per-op GPU timing breakdown |
+
+### Deployment
+| Command | Description |
+|---------|-------------|
 | `ai serve <model>` | OpenAI-compatible API server |
+
+### Introspection
+| Command | Description |
+|---------|-------------|
+| `ai explain <model> "prompt"` | Token-level attribution |
+| `ai checkpoint ls` | List training checkpoints |
+| `ai checkpoint diff <a> <b>` | Compare checkpoints |
+| `ai bench` | Raw GPU compute benchmark |
+| `ai gpus` | Detect and calibrate hardware |
+
+### Models
+| Command | Description |
+|---------|-------------|
 | `ai pull <org/model>` | Download from HuggingFace |
 | `ai models` | List downloaded models |
 | `ai info <model>` | Show model architecture |
-| `ai train data=<file>` | Train from scratch |
-| `ai train model=<name> data=<file>` | Fine-tune pretrained model |
-| `ai quantize <model> [q8\|q4\|f16]` | Quantize model weights |
-| `ai convert gguf <model>` | Convert to GGUF (for Ollama) |
-| `ai merge <base> <adapters>` | Merge LoRA into base model |
-| `ai bench` | Raw GPU benchmark |
-| `ai gpus` | Detect and calibrate GPUs |
 
 ## Performance
 
