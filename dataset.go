@@ -177,3 +177,158 @@ func formatCount(n int) string {
 		return fmt.Sprintf("%d", n)
 	}
 }
+
+// datasetSplit partitions a text file into train/val/test splits.
+// Splits by lines with optional shuffling. Writes to <base>_train.txt, etc.
+func datasetSplit(path string, trainR, valR, testR float64, seed int64) {
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("scan: %v", err)
+	}
+
+	rng := rand.New(rand.NewSource(seed))
+	rng.Shuffle(len(lines), func(i, j int) { lines[i], lines[j] = lines[j], lines[i] })
+
+	n := len(lines)
+	nTrain := int(float64(n) * trainR)
+	nVal := int(float64(n) * valR)
+	nTest := n - nTrain - nVal
+
+	trainLines := lines[:nTrain]
+	valLines := lines[nTrain : nTrain+nVal]
+	testLines := lines[nTrain+nVal:]
+
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+
+	writeLines := func(name string, data []string) {
+		outPath := base + "_" + name + ext
+		out, err := os.Create(outPath)
+		if err != nil {
+			log.Fatalf("create %s: %v", outPath, err)
+		}
+		w := bufio.NewWriter(out)
+		for _, line := range data {
+			w.WriteString(line)
+			w.WriteByte('\n')
+		}
+		w.Flush()
+		out.Close()
+		fmt.Printf("  %s: %d lines → %s\n", name, len(data), outPath)
+	}
+
+	fmt.Printf("ai dataset split — %s\n", path)
+	fmt.Printf("  total lines: %d (seed=%d)\n", n, seed)
+	fmt.Printf("  ratios: train=%.0f%% val=%.0f%% test=%.0f%%\n", trainR*100, valR*100, testR*100)
+	fmt.Println()
+
+	writeLines("train", trainLines)
+	writeLines("val", valLines)
+	if nTest > 0 {
+		writeLines("test", testLines)
+	}
+	fmt.Println("\ndone.")
+}
+
+// datasetAugment applies text transformations to a dataset.
+// Transforms: shuffle lines, lowercase, deduplicate, repeat N times.
+func datasetAugment(path, output string, repeat int, shuffle, lowercase, dedup bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("scan: %v", err)
+	}
+
+	origCount := len(lines)
+	fmt.Printf("ai dataset augment — %s\n", path)
+	fmt.Printf("  input: %d lines\n", origCount)
+
+	// Dedup
+	if dedup {
+		seen := make(map[string]bool)
+		var unique []string
+		for _, line := range lines {
+			key := strings.TrimSpace(line)
+			if key == "" {
+				continue
+			}
+			if !seen[key] {
+				seen[key] = true
+				unique = append(unique, line)
+			}
+		}
+		fmt.Printf("  dedup: %d → %d lines (-%d)\n", len(lines), len(unique), len(lines)-len(unique))
+		lines = unique
+	}
+
+	// Lowercase
+	if lowercase {
+		for i := range lines {
+			lines[i] = strings.ToLower(lines[i])
+		}
+		fmt.Println("  lowercase: applied")
+	}
+
+	// Repeat
+	if repeat > 1 {
+		var expanded []string
+		for r := 0; r < repeat; r++ {
+			expanded = append(expanded, lines...)
+		}
+		fmt.Printf("  repeat: %dx (%d → %d lines)\n", repeat, len(lines), len(expanded))
+		lines = expanded
+	}
+
+	// Shuffle
+	if shuffle {
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		rng.Shuffle(len(lines), func(i, j int) { lines[i], lines[j] = lines[j], lines[i] })
+		fmt.Println("  shuffle: applied")
+	}
+
+	// Output
+	if output == "" {
+		ext := filepath.Ext(path)
+		base := strings.TrimSuffix(path, ext)
+		output = base + "_augmented" + ext
+	}
+
+	out, err := os.Create(output)
+	if err != nil {
+		log.Fatalf("create: %v", err)
+	}
+	w := bufio.NewWriter(out)
+	for _, line := range lines {
+		w.WriteString(line)
+		w.WriteByte('\n')
+	}
+	w.Flush()
+	out.Close()
+
+	fmt.Printf("\n  output: %d lines → %s\n", len(lines), output)
+	fmt.Println("done.")
+}

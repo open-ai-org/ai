@@ -471,14 +471,7 @@ func cmdResume() {
 		LR:   float64(lr),
 	})
 
-	// Save weights
-	tensors := make(map[string]gguf.SaveTensor)
-	for i := 0; i < nW && i < len(paramNames); i++ {
-		buf := make([]float32, 1)
-		graph.GraphReadVariable(i, buf)
-		// GraphReadVariable fills the provided slice, but we need the full size
-		// For now just save the config — full weight save needs size info
-	}
+	// Save config (weight save requires backend-specific GraphReadVariable)
 	configOut, _ := json.MarshalIndent(cfg, "", "  ")
 	os.WriteFile(filepath.Join(saveDir, "config.json"), configOut, 0644)
 	fmt.Printf("Checkpoint saved: %s\n", saveDir)

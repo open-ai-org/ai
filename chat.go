@@ -74,32 +74,48 @@ func resolveModelName(name string) string {
 		cleanName = name[:idx]
 	}
 
-	// Try resolveModel first (handles existing paths)
-	if p := resolveModel(cleanName); p != "" {
-		return p
-	}
-	if p := resolveModel(name); p != "" {
-		return p
+	// Check if it's a direct path
+	if _, err := os.Stat(cleanName); err == nil {
+		return cleanName
 	}
 
-	// Try common HuggingFace naming patterns
 	home, _ := os.UserHomeDir()
-	modelsDir := filepath.Join(home, ".ai", "models")
-
-	// llama3 -> TinyLlama-*, Llama-3-*
-	// qwen2.5:0.5b -> Qwen2.5-0.5B
-	entries, err := os.ReadDir(modelsDir)
-	if err != nil {
-		return ""
+	dirs := []string{
+		filepath.Join(home, ".ai", "models"),
+		filepath.Join(home, ".mongoose", "models"),
+		filepath.Join(home, ".tesseract", "models"),
+	}
+	for _, d := range dirs {
+		for _, suffix := range []string{"", "-hf", "-chat"} {
+			p := filepath.Join(d, cleanName+suffix)
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
 	}
 
+	// Fuzzy match across all model dirs
 	lower := strings.ToLower(cleanName)
-	for _, e := range entries {
-		if strings.ToLower(e.Name()) == lower {
-			return filepath.Join(modelsDir, e.Name())
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
 		}
-		if strings.Contains(strings.ToLower(e.Name()), lower) {
-			return filepath.Join(modelsDir, e.Name())
+		for _, e := range entries {
+			if strings.ToLower(e.Name()) == lower {
+				return filepath.Join(d, e.Name())
+			}
+		}
+	}
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if strings.Contains(strings.ToLower(e.Name()), lower) {
+				return filepath.Join(d, e.Name())
+			}
 		}
 	}
 

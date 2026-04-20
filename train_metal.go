@@ -342,7 +342,7 @@ func cmdTrainMetal() {
 
 		for pos := 0; pos < n; pos++ {
 			off := pos * vocabSize
-			target := int(math.Float32frombits(math.Float32bits(targH[pos])))
+			target := int(int32(math.Float32bits(targH[pos])))
 
 			// Max for numerical stability
 			mx := logitsH[off]
@@ -406,9 +406,7 @@ func cmdTrainMetal() {
 		conductor.Observe(tokIDs)
 
 		// === FORWARD ===
-		mtl.FusedBegin()
-
-		// Embed gather on CPU (shared memory — zero copy on Apple Silicon)
+		// Embed gather BEFORE FusedBegin — write directly, no deferred blit
 		{
 			embedH := te.ToHost(embed)
 			hidH := make([]float32, n*dim)
@@ -418,8 +416,11 @@ func cmdTrainMetal() {
 			}
 			tmp := te.FromHost(hidH, []int{n, dim})
 			mtl.FusedCopy(hidden, tmp, n*dim)
+			mtl.Sync() // ensure copy completes before pool reclaims tmp
 			te.Release(tmp)
 		}
+
+		mtl.FusedBegin()
 
 		for li := range lays {
 			l := &lays[li]
