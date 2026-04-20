@@ -48,6 +48,9 @@ func cmdTrainCUDA() {
 	}
 	log.Println("[tesseract] CUDA kernels loaded")
 
+	sched := mongoose.NewScheduler(eng)
+	_ = sched
+
 	dim := *dimFlag
 	heads := *headsFlag
 	kvHeads := *kvHeadsFlag
@@ -220,6 +223,20 @@ func cmdTrainCUDA() {
 			nextTargL3[i] = math.Float32frombits(uint32(int32(data[start+i+1])))
 		}
 	}
+
+	// Calibrate scheduler on training op shapes
+	sched.CalibrateMatMul(n, dim, dim)       // QKV projections
+	sched.CalibrateMatMul(n, dim, kvDim)     // K/V projections
+	sched.CalibrateMatMul(n, dim, ffnDim)    // FFN gate/up
+	sched.CalibrateMatMul(n, ffnDim, dim)    // FFN down
+	sched.CalibrateMatMul(n, dim, vocabSize) // logits
+	sched.CalibrateAll(mongoose.NormKey(dim), func(e mongoose.Engine) {
+		d := make([]float32, dim)
+		w := make([]float32, dim)
+		for i := range w { w[i] = 1 }
+		e.RMSNorm(d, w, 1e-6)
+	})
+	log.Printf("[scheduler] calibrated %d GPUs, %d op shapes", sched.NumGPUs(), 6)
 
 	start0 := rng.Intn(len(data) - n - 1)
 	prepBatch(start0)
