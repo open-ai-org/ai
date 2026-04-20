@@ -107,9 +107,7 @@ func runFromScratch(dataPath string, args map[string]string) {
 		injectArgs(args, dataPath)
 		cmdTrainCUDA()
 	case "graph":
-		log.Println("[ai] using Metal fused kernel path")
-		injectArgs(args, dataPath)
-		cmdTrainMetal()
+		log.Fatal("[ai] Metal fused kernel path in progress — use 'cuda' or default")
 	default:
 		log.Println("[ai] using universal CPU path")
 		injectArgs(args, dataPath)

@@ -1,4 +1,4 @@
-//go:build darwin && cgo
+//go:build ignore
 
 package main
 
@@ -203,8 +203,7 @@ func cmdTrainMetal() {
 
 	var curLR float32
 	adamW := func(param, grad, mS, vS *mongoose.Tensor, step int) {
-		mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mS.DevicePtr(), vS.DevicePtr(),
-			curLR, 0.1, step, param.Size)
+		mtl.AdamWT(param, grad, mS, vS, curLR, 0.1, step)
 	}
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -409,7 +408,18 @@ func cmdTrainMetal() {
 		// === FORWARD ===
 		mtl.FusedBegin()
 
-		mongoose.KEmbedGather2(hidden.DevicePtr(), embed.DevicePtr(), tokGPU.DevicePtr(), n, dim)
+		// Embed gather on CPU (shared memory — zero copy on Apple Silicon)
+		{
+			embedH := te.ToHost(embed)
+			hidH := make([]float32, n*dim)
+			for i := 0; i < n; i++ {
+				tokID := data[start+i]
+				copy(hidH[i*dim:(i+1)*dim], embedH[tokID*dim:(tokID+1)*dim])
+			}
+			tmp := te.FromHost(hidH, []int{n, dim})
+			mtl.FusedCopy(hidden, tmp, n*dim)
+			te.Release(tmp)
+		}
 
 		for li := range lays {
 			l := &lays[li]
@@ -584,30 +594,29 @@ func cmdTrainMetal() {
 
 		mtl.FusedEnd()
 
-		// === Optimizer ===
+		// === Optimizer (Metal kernels) ===
+		bc1 := float32(1.0 - math.Pow(0.9, float64(step)))
+		bc2 := float32(1.0 - math.Pow(0.95, float64(step)))
+
 		for li := range lays {
 			l := &lays[li]
 			b := &bufs[li]
 			la := &layAS[li]
 
-			mongoose.KHelixDNAStep(
-				l.gate.DevicePtr(), l.up.DevicePtr(),
-				b.dWGate.DevicePtr(), b.dWUp.DevicePtr(),
-				la.gate.m.DevicePtr(), la.up.m.DevicePtr(),
-				la.gate.v.DevicePtr(), la.up.v.DevicePtr(),
-				curLR, 0.9, 0.95, step, 1e-8, 0.1,
+			// gate↔up: GC pair
+			mtl.DNARungGPU(
+				l.gate, b.dWGate, la.gate.m, la.gate.v,
+				l.up, b.dWUp, la.up.m, la.up.v,
 				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-				3.0/5.0, l.gate.Size)
+				3.0/5.0, curLR, 0.9, 0.95, bc1, bc2, 1e-8, 0.1, l.gate.Size)
 
+			// wq↔wk: AT pair — only when same size
 			if l.wq.Size == l.wk.Size {
-				mongoose.KHelixDNAStep(
-					l.wq.DevicePtr(), l.wk.DevicePtr(),
-					b.dWQ.DevicePtr(), b.dWK.DevicePtr(),
-					la.wq.m.DevicePtr(), la.wk.m.DevicePtr(),
-					la.wq.v.DevicePtr(), la.wk.v.DevicePtr(),
-					curLR, 0.9, 0.95, step, 1e-8, 0.1,
+				mtl.DNARungGPU(
+					l.wq, b.dWQ, la.wq.m, la.wq.v,
+					l.wk, b.dWK, la.wk.m, la.wk.v,
 					r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-					2.0/5.0, l.wq.Size)
+					2.0/5.0, curLR, 0.9, 0.95, bc1, bc2, 1e-8, 0.1, l.wq.Size)
 			} else {
 				adamW(l.wq, b.dWQ, la.wq.m, la.wq.v, step)
 				adamW(l.wk, b.dWK, la.wk.m, la.wk.v, step)
