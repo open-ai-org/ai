@@ -203,10 +203,10 @@ func cmdTrainCUDA() {
 		return minLR + float32(cosine)*float32(lr-minLR)
 	}
 
+	var curLR float32 // set each step by signal-scaled getLR
 	adamW := func(param, grad, mS, vS *mongoose.Tensor, step int) {
-		stepLR := getLR(step)
 		mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mS.DevicePtr(), vS.DevicePtr(),
-			stepLR, 0.1, step, param.Size)
+			curLR, 0.1, step, param.Size)
 	}
 
 	zero := func(t *mongoose.Tensor) {
@@ -266,6 +266,7 @@ func cmdTrainCUDA() {
 
 	var batchReady chan struct{}
 	curStart := start0
+	var prevLoss float32
 	for step := 1; step <= *stepsFlag; step++ {
 		// Wait for L3 prep goroutine from previous step
 		if batchReady != nil {
@@ -436,6 +437,17 @@ func cmdTrainCUDA() {
 		// === HELIX DNA optimizer with immune response ===
 		stepLR := getLR(step)
 		r, _, _, rewound := hlx.PrepareStep(step, stepLoss, stepLR)
+		// Signal-driven LR scaling: dampen when loss rebounds
+		if step > 1 && prevLoss > 0 {
+			dLoss := float64(stepLoss) - float64(prevLoss)
+			if dLoss > 0 {
+				ratio := float32(dLoss / math.Max(float64(prevLoss), 1e-6))
+				if ratio > 1.0 { ratio = 1.0 }
+				stepLR *= (1.0 - ratio) // scale down LR proportional to rebound
+			}
+		}
+		prevLoss = stepLoss
+		curLR = stepLR
 		if rewound {
 			if step <= 3 || step%*logEvery == 0 {
 				elapsed := time.Since(t0)
@@ -466,7 +478,7 @@ func cmdTrainCUDA() {
 				b.dWGate.DevicePtr(), b.dWUp.DevicePtr(),
 				la.gate.m.DevicePtr(), la.up.m.DevicePtr(),
 				la.gate.v.DevicePtr(), la.up.v.DevicePtr(),
-				stepLR, 0.9, 0.95, step, 1e-8, 0.1,
+				curLR, 0.9, 0.95, step, 1e-8, 0.1,
 				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
 				3.0/5.0, l.gate.Size)
 
@@ -477,7 +489,7 @@ func cmdTrainCUDA() {
 					b.dWQ.DevicePtr(), b.dWK.DevicePtr(),
 					la.wq.m.DevicePtr(), la.wk.m.DevicePtr(),
 					la.wq.v.DevicePtr(), la.wk.v.DevicePtr(),
-					stepLR, 0.9, 0.95, step, 1e-8, 0.1,
+					curLR, 0.9, 0.95, step, 1e-8, 0.1,
 					r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
 					2.0/5.0, l.wq.Size)
 			} else {

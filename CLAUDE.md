@@ -1,4 +1,4 @@
-# CLAUDE.md — Tesseract
+# CLAUDE.md — ai
 
 ## What This Is
 
@@ -7,18 +7,18 @@ Command-line interface for GPU-accelerated ML. Train, infer, quantize, serve. Po
 ## Build
 
 ```bash
-go build -o tesseract .
+go build -o ai .
 ```
 
 ## Usage
 
 ```bash
-tesseract pull Qwen/Qwen2.5-14B     # download from HuggingFace
-tesseract bench                       # benchmark your GPU
-tesseract infer qwen2-0.5b "Hello"   # generate text
-tesseract quantize model q8           # quantize to INT8
-tesseract serve model                 # OpenAI-compatible API server
-tesseract convert gguf model          # convert to GGUF for Ollama
+ai pull Qwen/Qwen2.5-14B       # download from HuggingFace
+ai bench                       # benchmark your GPU
+ai infer qwen2-0.5b "Hello"    # generate text
+ai quantize model q8           # quantize to INT8
+ai serve model                 # OpenAI-compatible API server
+ai convert gguf model          # convert to GGUF for Ollama
 ```
 
 ## Architecture

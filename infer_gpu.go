@@ -66,6 +66,7 @@ func cmdInferGPU(model string, promptParts []string) {
 
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
+	mongoose.LoadKernels()
 
 	// Detect quantization
 	isAWQ := false
@@ -355,6 +356,188 @@ func cmdInferGPU(model string, promptParts []string) {
 		logits := te.ToHost(tLogits)
 		te.Release(tLogits)
 		return logits
+	}
+
+	// === CUDA Q8 fused path ===
+	gpuForwardQ8 := func(tokenID, pos int) []float32 { return nil }
+	useCUDAQ8 := false
+
+	if cuda, ok := eng.(*mongoose.CUDA); ok && mongoose.HasQ8Matvec() && mongoose.KernelsLoaded() {
+		_ = cuda
+		type q8Weight struct {
+			data   unsafe.Pointer // int8 on GPU [rows*cols bytes]
+			scales unsafe.Pointer // float32 on GPU [rows floats]
+			rows   int
+			cols   int
+		}
+		quantizeToGPU := func(fp32 []float32, rows, cols int) q8Weight {
+			q := make([]int8, rows*cols)
+			s := make([]float32, rows)
+			for r := 0; r < rows; r++ {
+				var absMax float32
+				for c := 0; c < cols; c++ {
+					v := fp32[r*cols+c]
+					if v < 0 {
+						v = -v
+					}
+					if v > absMax {
+						absMax = v
+					}
+				}
+				s[r] = absMax
+				invScale := float32(0)
+				if absMax > 0 {
+					invScale = 127.0 / absMax
+				}
+				for c := 0; c < cols; c++ {
+					v := fp32[r*cols+c] * invScale
+					if v > 127 {
+						v = 127
+					}
+					if v < -127 {
+						v = -127
+					}
+					q[r*cols+c] = int8(v)
+				}
+			}
+			// Pack int8 data into float32 slice for upload via FromHost
+			nBytes := rows * cols
+			nFloats := (nBytes + 3) / 4
+			packed := make([]float32, nFloats)
+			copy((*[1 << 30]byte)(unsafe.Pointer(&packed[0]))[:nBytes], (*[1 << 30]byte)(unsafe.Pointer(&q[0]))[:nBytes])
+			tData := te.FromHost(packed, []int{1, nFloats})
+			tScales := te.FromHost(s, []int{1, rows})
+			return q8Weight{data: tData.DevicePtr(), scales: tScales.DevicePtr(), rows: rows, cols: cols}
+		}
+
+		type q8Layer struct {
+			wq, wk, wv, wo    q8Weight
+			gate, up, down     q8Weight
+			bq, bk, bv         *mongoose.Tensor
+			gnorm1, gnorm2     *mongoose.Tensor
+		}
+
+		fmt.Print("Quantizing weights to Q8... ")
+		q8Layers := make([]q8Layer, nLayers)
+		for l := 0; l < nLayers; l++ {
+			gl := &gpuLayers[l]
+			q8l := &q8Layers[l]
+			q8l.gnorm1 = gl.gnorm1
+			q8l.gnorm2 = gl.gnorm2
+			q8l.bq = gl.bq
+			q8l.bk = gl.bk
+			q8l.bv = gl.bv
+
+			prefix := fmt.Sprintf("model.layers.%d.", l)
+			loadQ8 := func(name string, rows, cols int) q8Weight {
+				data, _, _, _ := readWeight(prefix+name, rows, cols)
+				return quantizeToGPU(data, rows, cols)
+			}
+			q8l.wq = loadQ8("self_attn.q_proj.weight", dim, dim)
+			q8l.wk = loadQ8("self_attn.k_proj.weight", kvDim, dim)
+			q8l.wv = loadQ8("self_attn.v_proj.weight", kvDim, dim)
+			q8l.wo = loadQ8("self_attn.o_proj.weight", dim, dim)
+			q8l.gate = loadQ8("mlp.gate_proj.weight", ffnDim, dim)
+			q8l.up = loadQ8("mlp.up_proj.weight", ffnDim, dim)
+			q8l.down = loadQ8("mlp.down_proj.weight", dim, ffnDim)
+		}
+		q8LMHead := quantizeToGPU(lmHeadData, vocabSize, dim)
+		fmt.Println("done")
+
+		useCUDAQ8 = true
+
+		q8MV := func(actPtr unsafe.Pointer, w q8Weight, outPtr unsafe.Pointer) {
+			mongoose.KQ8Matvec(actPtr, w.data, w.scales, outPtr, w.rows, w.cols)
+		}
+
+		gpuForwardQ8 = func(tokenID, pos int) []float32 {
+			tokOff := tokenID * dim
+			if tokOff+dim > len(embedData) {
+				return nil
+			}
+			xGPU := te.FromHost(embedData[tokOff:tokOff+dim], []int{1, dim})
+
+			for l := 0; l < nLayers; l++ {
+				ql := &q8Layers[l]
+
+				normed := te.Zeros([]int{1, dim})
+				mongoose.KRMSNormOut(xGPU.DevicePtr(), normed.DevicePtr(), ql.gnorm1.DevicePtr(), 1, dim)
+
+				tQ := te.Zeros([]int{1, dim})
+				tK := te.Zeros([]int{1, kvDim})
+				tV := te.Zeros([]int{1, kvDim})
+				q8MV(normed.DevicePtr(), ql.wq, tQ.DevicePtr())
+				q8MV(normed.DevicePtr(), ql.wk, tK.DevicePtr())
+				q8MV(normed.DevicePtr(), ql.wv, tV.DevicePtr())
+				te.Release(normed)
+
+				if ql.bq != nil {
+					te.AddInPlace(tQ, ql.bq)
+				}
+				if ql.bk != nil {
+					te.AddInPlace(tK, ql.bk)
+				}
+				if ql.bv != nil {
+					te.AddInPlace(tV, ql.bv)
+				}
+
+				cosOff := unsafe.Add(gpuRopeCos.DevicePtr(), uintptr(pos*halfHead*4))
+				sinOff := unsafe.Add(gpuRopeSin.DevicePtr(), uintptr(pos*halfHead*4))
+				mongoose.KRoPE(tQ.DevicePtr(), cosOff, sinOff, 1, dim, headDim, heads)
+				mongoose.KRoPE(tK.DevicePtr(), cosOff, sinOff, 1, kvDim, headDim, kvHeads)
+
+				kv := &gpuKV[l]
+				mongoose.KCopy(
+					unsafe.Add(kv.k.DevicePtr(), uintptr(pos*kvDim*4)),
+					tK.DevicePtr(), kvDim*4)
+				mongoose.KCopy(
+					unsafe.Add(kv.v.DevicePtr(), uintptr(pos*kvDim*4)),
+					tV.DevicePtr(), kvDim*4)
+				te.Release(tK)
+				te.Release(tV)
+
+				tAttnOut := te.Zeros([]int{1, dim})
+				mongoose.KDecodeAttention(tQ.DevicePtr(), kv.k.DevicePtr(), kv.v.DevicePtr(),
+					tAttnOut.DevicePtr(), pos+1, dim, kvDim, heads, kvHeads)
+				te.Release(tQ)
+
+				tProj := te.Zeros([]int{1, dim})
+				q8MV(tAttnOut.DevicePtr(), ql.wo, tProj.DevicePtr())
+				te.Release(tAttnOut)
+				te.AddInPlace(xGPU, tProj)
+				te.Release(tProj)
+
+				normed2 := te.Zeros([]int{1, dim})
+				mongoose.KRMSNormOut(xGPU.DevicePtr(), normed2.DevicePtr(), ql.gnorm2.DevicePtr(), 1, dim)
+
+				tGate := te.Zeros([]int{1, ffnDim})
+				tUp := te.Zeros([]int{1, ffnDim})
+				q8MV(normed2.DevicePtr(), ql.gate, tGate.DevicePtr())
+				q8MV(normed2.DevicePtr(), ql.up, tUp.DevicePtr())
+				te.Release(normed2)
+
+				ffnMid := te.Zeros([]int{1, ffnDim})
+				mongoose.KSiLUGateMul(tGate.DevicePtr(), tUp.DevicePtr(), ffnMid.DevicePtr(), ffnDim)
+				te.Release(tGate)
+				te.Release(tUp)
+
+				tDown := te.Zeros([]int{1, dim})
+				q8MV(ffnMid.DevicePtr(), ql.down, tDown.DevicePtr())
+				te.Release(ffnMid)
+				te.AddInPlace(xGPU, tDown)
+				te.Release(tDown)
+			}
+
+			mongoose.KRMSNorm(xGPU.DevicePtr(), gpuFinalNormT.DevicePtr(), 1, dim)
+
+			tLogits := te.Zeros([]int{1, vocabSize})
+			mongoose.KQ8Matvec(xGPU.DevicePtr(), q8LMHead.data, q8LMHead.scales, tLogits.DevicePtr(), vocabSize, dim)
+			te.Release(xGPU)
+
+			logits := te.ToHost(tLogits)
+			te.Release(tLogits)
+			return logits
+		}
 	}
 
 	// === Tier 2 & 3: CPU attention, GPU or CPU matmul ===
@@ -782,6 +965,9 @@ func cmdInferGPU(model string, promptParts []string) {
 	fwd := forward
 	if useFused {
 		fwd = fusedForward
+	} else if useCUDAQ8 {
+		fwd = gpuForwardQ8
+		fmt.Println("  infer: CUDA Q8 fused matvec")
 	} else if useMetalGraph {
 		fwd = metalForward
 	} else if useGPUKernels && gpuResident {
