@@ -13,6 +13,8 @@ import (
 	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/helix"
 	"github.com/open-ai-org/mongoose"
+
+	"unsafe"
 )
 
 func cmdFinetune() {
@@ -79,14 +81,42 @@ func cmdFinetune() {
 	if fnData == nil { fnData = make([]float32, dim); for i := range fnData { fnData[i] = 1 } }
 	finalNorm := te.FromHost(fnData, []int{1, dim})
 
-	type layer struct{ wq, wk, wv, wo, gate, up, down, norm1, norm2 *mongoose.Tensor }
+	// INT8 weight + FP32 dequant cache + needle state
+	type needleWeight struct {
+		q8    *mongoose.Int8Tensor  // INT8 weights (updated by needle)
+		cache *mongoose.Tensor      // FP32 dequant cache (read by matmuls)
+		mom   unsafe.Pointer        // FP16 momentum
+		vel   unsafe.Pointer        // FP16 delta residual
+		mask  unsafe.Pointer        // row mask (all active for full finetune)
+	}
+	quantLoad := func(data []float32, rows, cols int) needleWeight {
+		qt := gguf.QuantizeToInt8(data, rows, cols)
+		q8 := cuda.FromHostInt8(&mongoose.QuantizedTensor{
+			DataInt8: qt.DataInt8, Scales: qt.Scales, Shape: qt.Shape,
+			Rows: qt.Rows, Cols: qt.Cols,
+		})
+		cache := te.Zeros([]int{rows, cols})
+		cuda.DequantToFP32(q8, cache.DevicePtr())
+		nEl := rows * cols
+		momPtr := cuda.AllocGPU(nEl * 2)
+		velPtr := cuda.AllocGPU(nEl * 2)
+		maskData := make([]float32, rows)
+		for r := range maskData { maskData[r] = float32(r + 1) }
+		maskT := te.FromHost(maskData, []int{rows})
+		return needleWeight{q8: q8, cache: cache, mom: momPtr, vel: velPtr, mask: maskT.DevicePtr()}
+	}
+
+	type layer struct {
+		wq, wk, wv, wo, gate, up, down needleWeight
+		norm1, norm2                    *mongoose.Tensor
+	}
 	lays := make([]layer, nLayers)
 	for l := 0; l < nLayers; l++ {
 		pfx := fmt.Sprintf("model.layers.%d.", l)
-		loadW := func(name string, rows, cols int) *mongoose.Tensor {
+		loadQ := func(name string, rows, cols int) needleWeight {
 			d, _, err := st.ReadTensorFloat32(pfx + name)
 			if err != nil { log.Fatalf("layer %d %s: %v", l, name, err) }
-			return te.FromHost(d, []int{rows, cols})
+			return quantLoad(d, rows, cols)
 		}
 		loadNorm := func(name string) *mongoose.Tensor {
 			d, _, _ := st.ReadTensorFloat32(pfx + name)
@@ -94,38 +124,29 @@ func cmdFinetune() {
 			return te.FromHost(d, []int{1, dim})
 		}
 		lays[l] = layer{
-			wq:    loadW("self_attn.q_proj.weight", dim, dim),
-			wk:    loadW("self_attn.k_proj.weight", kvDim, dim),
-			wv:    loadW("self_attn.v_proj.weight", kvDim, dim),
-			wo:    loadW("self_attn.o_proj.weight", dim, dim),
-			gate:  loadW("mlp.gate_proj.weight", ffnDim, dim),
-			up:    loadW("mlp.up_proj.weight", ffnDim, dim),
-			down:  loadW("mlp.down_proj.weight", dim, ffnDim),
+			wq:    loadQ("self_attn.q_proj.weight", dim, dim),
+			wk:    loadQ("self_attn.k_proj.weight", kvDim, dim),
+			wv:    loadQ("self_attn.v_proj.weight", kvDim, dim),
+			wo:    loadQ("self_attn.o_proj.weight", dim, dim),
+			gate:  loadQ("mlp.gate_proj.weight", ffnDim, dim),
+			up:    loadQ("mlp.up_proj.weight", ffnDim, dim),
+			down:  loadQ("mlp.down_proj.weight", dim, ffnDim),
 			norm1: loadNorm("input_layernorm.weight"),
 			norm2: loadNorm("post_attention_layernorm.weight"),
 		}
 		if (l+1)%10 == 0 || l == nLayers-1 {
-			log.Printf("[finetune] loaded layer %d/%d", l+1, nLayers)
+			log.Printf("[finetune] loaded layer %d/%d (INT8 + FP32 cache)", l+1, nLayers)
 		}
 	}
 
 	// Helix — CPU computes rung, GPU kernel applies DNA-coupled update
 	hlx := helix.NewHelixOptimizer(lr, 0.9, 0.95, 1e-8, 0.1)
 
-	// GPU Adam state for all weights
+	// Embed + lm_head stay FP32 (not INT8-quantized)
 	type as struct{ m, v *mongoose.Tensor }
 	newAS := func(sz int) as { return as{te.Zeros([]int{sz}), te.Zeros([]int{sz})} }
 	embedAS := newAS(vocabSize * dim)
 	lmHeadAS := newAS(vocabSize * dim)
-	type layerAS struct{ wq, wk, wv, wo, gate, up, down as }
-	layAS := make([]layerAS, nLayers)
-	for l := range layAS {
-		layAS[l] = layerAS{
-			wq: newAS(dim * dim), wk: newAS(kvDim * dim), wv: newAS(kvDim * dim),
-			wo: newAS(dim * dim), gate: newAS(ffnDim * dim), up: newAS(ffnDim * dim),
-			down: newAS(dim * ffnDim),
-		}
-	}
 
 	hidden := te.Zeros([]int{n, dim})
 	tokGPU := te.Zeros([]int{n})
@@ -235,9 +256,9 @@ func cmdFinetune() {
 			mongoose.KRMSNormOutSave(hidden.DevicePtr(), b.normed.DevicePtr(),
 				l.norm1.DevicePtr(), b.rmsScale1.DevicePtr(), n, dim)
 
-			cuda.MatMulTransposeBTInto(b.Q, b.normed, l.wq, n, dim, dim)
-			cuda.MatMulTransposeBTInto(b.K, b.normed, l.wk, n, dim, kvDim)
-			cuda.MatMulTransposeBTInto(b.V, b.normed, l.wv, n, dim, kvDim)
+			cuda.MatMulTransposeBTInto(b.Q, b.normed, l.wq.cache, n, dim, dim)
+			cuda.MatMulTransposeBTInto(b.K, b.normed, l.wk.cache, n, dim, kvDim)
+			cuda.MatMulTransposeBTInto(b.V, b.normed, l.wv.cache, n, dim, kvDim)
 
 			mongoose.KRoPE(b.Q.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
 			mongoose.KRoPE(b.K.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
@@ -246,7 +267,7 @@ func cmdFinetune() {
 			mongoose.KCausalAttentionGQA(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.attnOut.DevicePtr(),
 				n, dim, kvDim, heads, kvHeads)
 
-			cuda.MatMulTransposeBTInto(b.dx, b.attnOut, l.wo, n, dim, dim)
+			cuda.MatMulTransposeBTInto(b.dx, b.attnOut, l.wo.cache, n, dim, dim)
 			te.AddInPlace(hidden, b.dx)
 
 			cuda.CopyInto(b.xMid, hidden)
@@ -254,13 +275,13 @@ func cmdFinetune() {
 			mongoose.KRMSNormOutSave(hidden.DevicePtr(), b.normed2.DevicePtr(),
 				l.norm2.DevicePtr(), b.rmsScale2.DevicePtr(), n, dim)
 
-			cuda.MatMulTransposeBTInto(b.gatePre, b.normed2, l.gate, n, dim, ffnDim)
-			cuda.MatMulTransposeBTInto(b.upOut, b.normed2, l.up, n, dim, ffnDim)
+			cuda.MatMulTransposeBTInto(b.gatePre, b.normed2, l.gate.cache, n, dim, ffnDim)
+			cuda.MatMulTransposeBTInto(b.upOut, b.normed2, l.up.cache, n, dim, ffnDim)
 
 			zero(b.ffnMid)
 			mongoose.KSiLUGateMul(b.gatePre.DevicePtr(), b.upOut.DevicePtr(), b.ffnMid.DevicePtr(), n*ffnDim)
 
-			cuda.MatMulTransposeBTInto(b.dx, b.ffnMid, l.down, n, ffnDim, dim)
+			cuda.MatMulTransposeBTInto(b.dx, b.ffnMid, l.down.cache, n, ffnDim, dim)
 			te.AddInPlace(hidden, b.dx)
 		}
 
@@ -297,15 +318,15 @@ func cmdFinetune() {
 			l := &lays[li]
 			b := &bufs[li]
 
-			cuda.MatMulTInto(b.dFfnMid, dHidden, l.down, n, dim, ffnDim)
+			cuda.MatMulTInto(b.dFfnMid, dHidden, l.down.cache, n, dim, ffnDim)
 			cuda.MatMulTransposeATInto(b.dWDown, dHidden, b.ffnMid, n, dim, ffnDim)
 
 			zero(b.dGate); zero(b.dUp)
 			mongoose.KSiLUGateBackward(b.dFfnMid.DevicePtr(), b.gatePre.DevicePtr(),
 				b.upOut.DevicePtr(), b.dGate.DevicePtr(), b.dUp.DevicePtr(), n*ffnDim)
 
-			cuda.MatMulTInto(b.dN2, b.dGate, l.gate, n, ffnDim, dim)
-			cuda.MatMulTInto(b.dx, b.dUp, l.up, n, ffnDim, dim)
+			cuda.MatMulTInto(b.dN2, b.dGate, l.gate.cache, n, ffnDim, dim)
+			cuda.MatMulTInto(b.dx, b.dUp, l.up.cache, n, ffnDim, dim)
 			te.AddInPlace(b.dN2, b.dx)
 
 			cuda.MatMulTransposeATInto(b.dWGate, b.dGate, b.normed2, n, ffnDim, dim)
@@ -316,7 +337,7 @@ func cmdFinetune() {
 				l.norm2.DevicePtr(), b.rmsScale2.DevicePtr(), b.dx.DevicePtr(), n, dim)
 			te.AddInPlace(dHidden, b.dx)
 
-			cuda.MatMulTInto(b.dAttnOut, dHidden, l.wo, n, dim, dim)
+			cuda.MatMulTInto(b.dAttnOut, dHidden, l.wo.cache, n, dim, dim)
 			cuda.MatMulTransposeATInto(b.dWO, dHidden, b.attnOut, n, dim, dim)
 
 			zero(b.dQ); zero(b.dK); zero(b.dV)
@@ -326,9 +347,9 @@ func cmdFinetune() {
 			mongoose.KRoPEBackward(b.dQ.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
 			mongoose.KRoPEBackward(b.dK.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
 
-			cuda.MatMulTInto(b.dN1, b.dQ, l.wq, n, dim, dim)
-			cuda.MatMulTInto(b.dx, b.dK, l.wk, n, kvDim, dim)
-			cuda.MatMulTInto(b.dN2, b.dV, l.wv, n, kvDim, dim)
+			cuda.MatMulTInto(b.dN1, b.dQ, l.wq.cache, n, dim, dim)
+			cuda.MatMulTInto(b.dx, b.dK, l.wk.cache, n, kvDim, dim)
+			cuda.MatMulTInto(b.dN2, b.dV, l.wv.cache, n, kvDim, dim)
 			te.AddInPlace(b.dN1, b.dx); te.AddInPlace(b.dN1, b.dN2)
 
 			cuda.MatMulTransposeATInto(b.dWQ, b.dQ, b.normed, n, dim, dim)
@@ -341,24 +362,30 @@ func cmdFinetune() {
 			te.AddInPlace(dHidden, b.dx)
 		}
 
-		// === HELIX OPTIMIZER — CPU computes rung, GPU applies ===
-		// Advance helix phase, get rung coefficients
+		// === HELIX + NEEDLE — CPU rung, GPU INT8 update ===
 		hlx.Step(step, stepLoss, lr)
 		r := hlx.CurrentRung()
 		beta1 := float32(0.9)
 		beta2 := float32(0.95)
 
-		// DNA-coupled updates for paired weights (gate↔up, wq↔wk)
-		dnaStep := func(w1, g1, m1, v1, w2, g2, m2, v2 *mongoose.Tensor, bs float32) {
-			mongoose.KHelixDNAStep(
-				w1.DevicePtr(), w2.DevicePtr(), g1.DevicePtr(), g2.DevicePtr(),
-				m1.DevicePtr(), m2.DevicePtr(), v1.DevicePtr(), v2.DevicePtr(),
+		// Needle: update INT8 weights directly + refresh dequant cache
+		needleUpdate := func(nw *needleWeight, gradT *mongoose.Tensor) {
+			mongoose.KHelixNeedle(nw.q8.DataPtr, nw.q8.ScalePtr, gradT.DevicePtr(),
+				nw.mom, nw.vel, nw.mask,
+				lr, beta1, beta2, step, 1e-8, 0.1, nw.q8.Rows*nw.q8.Cols, nw.q8.Cols)
+			cuda.DequantToFP32(nw.q8, nw.cache.DevicePtr())
+		}
+		needlePaired := func(nw1, nw2 *needleWeight, g1, g2 *mongoose.Tensor, bs float32) {
+			mongoose.KHelixNeedlePaired(
+				nw1.q8.DataPtr, nw2.q8.DataPtr, nw1.q8.ScalePtr, nw2.q8.ScalePtr,
+				g1.DevicePtr(), g2.DevicePtr(),
+				nw1.mom, nw2.mom, nw1.vel, nw2.vel, nw1.mask,
 				lr, beta1, beta2, step, 1e-8, 0.1,
 				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-				bs, w1.Size,
-			)
+				bs, nw1.q8.Rows*nw1.q8.Cols, nw1.q8.Cols)
+			cuda.DequantToFP32(nw1.q8, nw1.cache.DevicePtr())
+			cuda.DequantToFP32(nw2.q8, nw2.cache.DevicePtr())
 		}
-		// Singles use standard AdamW
 		adamW := func(param, grad, mS, vS *mongoose.Tensor) {
 			mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mS.DevicePtr(), vS.DevicePtr(),
 				lr, 0.1, step, param.Size)
@@ -366,20 +393,16 @@ func cmdFinetune() {
 
 		for li := range lays {
 			b := &bufs[li]
-			// gate↔up: G↔C bond (3 H-bonds) — same size, safe to pair
-			dnaStep(lays[li].gate, b.dWGate, layAS[li].gate.m, layAS[li].gate.v,
-				lays[li].up, b.dWUp, layAS[li].up.m, layAS[li].up.v, 3.0/5.0)
-			// wq↔wk: only pair if same size (MHA), otherwise singles (GQA)
-			if lays[li].wq.Size == lays[li].wk.Size {
-				dnaStep(lays[li].wq, b.dWQ, layAS[li].wq.m, layAS[li].wq.v,
-					lays[li].wk, b.dWK, layAS[li].wk.m, layAS[li].wk.v, 2.0/5.0)
+			needlePaired(&lays[li].gate, &lays[li].up, b.dWGate, b.dWUp, 3.0/5.0)
+			if lays[li].wq.q8.Rows == lays[li].wk.q8.Rows && lays[li].wq.q8.Cols == lays[li].wk.q8.Cols {
+				needlePaired(&lays[li].wq, &lays[li].wk, b.dWQ, b.dWK, 2.0/5.0)
 			} else {
-				adamW(lays[li].wq, b.dWQ, layAS[li].wq.m, layAS[li].wq.v)
-				adamW(lays[li].wk, b.dWK, layAS[li].wk.m, layAS[li].wk.v)
+				needleUpdate(&lays[li].wq, b.dWQ)
+				needleUpdate(&lays[li].wk, b.dWK)
 			}
-			adamW(lays[li].wv, b.dWV, layAS[li].wv.m, layAS[li].wv.v)
-			adamW(lays[li].wo, b.dWO, layAS[li].wo.m, layAS[li].wo.v)
-			adamW(lays[li].down, b.dWDown, layAS[li].down.m, layAS[li].down.v)
+			needleUpdate(&lays[li].wv, b.dWV)
+			needleUpdate(&lays[li].wo, b.dWO)
+			needleUpdate(&lays[li].down, b.dWDown)
 		}
 		adamW(lmHead, dLmHead, lmHeadAS.m, lmHeadAS.v)
 		adamW(embed, dLmHead, embedAS.m, embedAS.v)
