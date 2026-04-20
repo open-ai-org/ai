@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/open-ai-org/helix"
 	"github.com/open-ai-org/mongoose"
 )
 
@@ -108,17 +109,56 @@ func cmdTrainCUDA() {
 		}
 	}
 
-	type as struct{ m, v *mongoose.Tensor }
-	newAS := func(sz int) as { return as{te.Zeros([]int{sz}), te.Zeros([]int{sz})} }
-	embedAS := newAS(vocabSize * dim)
-	type layerAS struct{ wq, wk, wv, wo, gate, up, down as }
-	layAS := make([]layerAS, nLayers)
-	for l := range layAS {
-		layAS[l] = layerAS{
-			wq: newAS(dim * dim), wk: newAS(kvDim * dim), wv: newAS(kvDim * dim),
-			wo: newAS(dim * dim), gate: newAS(ffnDim * dim), up: newAS(ffnDim * dim),
-			down: newAS(dim * ffnDim),
+	// Helix optimizer — host-side weight copies + momentum/velocity
+	hlx := helix.NewHelixOptimizer(lr, 0.9, 0.95, 1e-8, 0.1)
+
+	type helixWeight struct {
+		gpu  *mongoose.Tensor
+		hp   *helix.SimpleHelixParam
+	}
+	newHW := func(gpu *mongoose.Tensor) helixWeight {
+		sz := gpu.Size
+		d := te.ToHost(gpu)
+		return helixWeight{
+			gpu: gpu,
+			hp: &helix.SimpleHelixParam{
+				D: d,
+				G: make([]float32, sz),
+				M: make([]float32, sz),
+				V: make([]float32, sz),
+				N: sz,
+			},
 		}
+	}
+
+	embedHW := newHW(embed)
+	hlx.Register(embedHW.hp)
+
+	type layerHW struct{ wq, wk, wv, wo, gate, up, down helixWeight }
+	layHW := make([]layerHW, nLayers)
+	for l := range layHW {
+		layHW[l] = layerHW{
+			wq: newHW(lays[l].wq), wk: newHW(lays[l].wk), wv: newHW(lays[l].wv),
+			wo: newHW(lays[l].wo), gate: newHW(lays[l].gate), up: newHW(lays[l].up),
+			down: newHW(lays[l].down),
+		}
+		// DNA pairing: gate↔up (SwiGLU pair), wq↔wk (attention pair)
+		hlx.PairAT(layHW[l].gate.hp, layHW[l].up.hp)
+		hlx.PairGC(layHW[l].wq.hp, layHW[l].wk.hp)
+		hlx.Register(layHW[l].wv.hp)
+		hlx.Register(layHW[l].wo.hp)
+		hlx.Register(layHW[l].down.hp)
+	}
+
+	// Sync helper: download grad from GPU into helix param, then after Step upload weights back
+	syncGrad := func(hw *helixWeight, gradGPU *mongoose.Tensor) {
+		cuda.Sync()
+		copy(hw.hp.G, te.ToHost(gradGPU))
+	}
+	syncWeights := func(hw *helixWeight) {
+		tmp := te.FromHost(hw.hp.D, hw.gpu.Shape)
+		cuda.CopyInto(hw.gpu, tmp)
+		te.Release(tmp)
 	}
 
 	hidden := te.Zeros([]int{n, dim})
@@ -181,26 +221,6 @@ func cmdTrainCUDA() {
 	fmt.Println()
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	totalSteps := *stepsFlag
-	warmupSteps := totalSteps / 10
-	if warmupSteps < 10 { warmupSteps = 10 }
-	minLR := lr / 10.0
-
-	getLR := func(step int) float32 {
-		if step < warmupSteps {
-			return lr * float32(step) / float32(warmupSteps)
-		}
-		progress := float64(step-warmupSteps) / float64(totalSteps-warmupSteps)
-		cosine := 0.5 * (1.0 + math.Cos(math.Pi*progress))
-		return minLR + float32(cosine)*float32(lr-minLR)
-	}
-
-	adamW := func(param, grad, mS, vS *mongoose.Tensor, step int) {
-		stepLR := getLR(step)
-		mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mS.DevicePtr(), vS.DevicePtr(),
-			stepLR, 0.1, step, param.Size)
-	}
 
 	zero := func(t *mongoose.Tensor) {
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
@@ -312,16 +332,14 @@ func cmdTrainCUDA() {
 		mongoose.KSoftmaxCE(logitsBuf.DevicePtr(), targetsGPU.DevicePtr(),
 			lossesGPU.DevicePtr(), gradGPU.DevicePtr(), n, vocabSize, invN)
 
-		// Deferred loss read — only sync on log steps
+		// Always read loss — helix immune system needs it every step
+		cuda.Sync()
 		var stepLoss float32
-		if step <= 3 || step%*logEvery == 0 {
-			cuda.Sync()
-			lossH := te.ToHost(lossesGPU)
-			for _, l := range lossH { stepLoss += l }
-			stepLoss /= float32(n)
-		}
+		lossH := te.ToHost(lossesGPU)
+		for _, l := range lossH { stepLoss += l }
+		stepLoss /= float32(n)
 
-		// === BACKWARD ===
+		// === BACKWARD (GPU) ===
 		cuda.MatMulTransposeATInto(dEmbed, gradGPU, normedFinal, n, vocabSize, dim)
 		cuda.MatMulTInto(dHidden, gradGPU, embed, n, vocabSize, dim)
 
@@ -335,9 +353,7 @@ func cmdTrainCUDA() {
 			b := &bufs[li]
 
 			cuda.MatMulTInto(b.dFfnMid, dHidden, l.down, n, dim, ffnDim)
-
 			cuda.MatMulTransposeATInto(b.dWDown, b.ffnMid, dHidden, n, ffnDim, dim)
-			adamW(l.down, b.dWDown, layAS[li].down.m, layAS[li].down.v, step)
 
 			zero(b.dGate); zero(b.dUp)
 			mongoose.KSiLUGateBackward(b.dFfnMid.DevicePtr(), b.gatePre.DevicePtr(),
@@ -349,8 +365,6 @@ func cmdTrainCUDA() {
 
 			cuda.MatMulTransposeATInto(b.dWGate, b.normed2, b.dGate, n, dim, ffnDim)
 			cuda.MatMulTransposeATInto(b.dWUp, b.normed2, b.dUp, n, dim, ffnDim)
-			adamW(l.gate, b.dWGate, layAS[li].gate.m, layAS[li].gate.v, step)
-			adamW(l.up, b.dWUp, layAS[li].up.m, layAS[li].up.v, step)
 
 			zero(b.dx)
 			mongoose.KRMSNormBackward(b.dN2.DevicePtr(), b.xMid.DevicePtr(),
@@ -359,7 +373,6 @@ func cmdTrainCUDA() {
 
 			cuda.MatMulTInto(b.dAttnOut, dHidden, l.wo, n, dim, dim)
 			cuda.MatMulTransposeATInto(b.dWO, b.attnOut, dHidden, n, dim, dim)
-			adamW(l.wo, b.dWO, layAS[li].wo.m, layAS[li].wo.v, step)
 
 			zero(b.dQ); zero(b.dK); zero(b.dV)
 			mongoose.KCausalAttentionBackward(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.dAttnOut.DevicePtr(),
@@ -376,9 +389,6 @@ func cmdTrainCUDA() {
 			cuda.MatMulTransposeATInto(b.dWQ, b.normed, b.dQ, n, dim, dim)
 			cuda.MatMulTransposeATInto(b.dWK, b.normed, b.dK, n, dim, kvDim)
 			cuda.MatMulTransposeATInto(b.dWV, b.normed, b.dV, n, dim, kvDim)
-			adamW(l.wq, b.dWQ, layAS[li].wq.m, layAS[li].wq.v, step)
-			adamW(l.wk, b.dWK, layAS[li].wk.m, layAS[li].wk.v, step)
-			adamW(l.wv, b.dWV, layAS[li].wv.m, layAS[li].wv.v, step)
 
 			zero(b.dx)
 			mongoose.KRMSNormBackward(b.dN1.DevicePtr(), b.xIn.DevicePtr(),
@@ -386,11 +396,39 @@ func cmdTrainCUDA() {
 			te.AddInPlace(dHidden, b.dx)
 		}
 
-		adamW(embed, dEmbed, embedAS.m, embedAS.v, step)
+		// === HELIX OPTIMIZER (CPU) ===
+		// Download grads from GPU
+		syncGrad(&embedHW, dEmbed)
+		for li := range layHW {
+			b := &bufs[li]
+			syncGrad(&layHW[li].down, b.dWDown)
+			syncGrad(&layHW[li].gate, b.dWGate)
+			syncGrad(&layHW[li].up, b.dWUp)
+			syncGrad(&layHW[li].wo, b.dWO)
+			syncGrad(&layHW[li].wq, b.dWQ)
+			syncGrad(&layHW[li].wk, b.dWK)
+			syncGrad(&layHW[li].wv, b.dWV)
+		}
+
+		// Helix step — DNA gradient descent with immune system
+		hlx.Step(step, stepLoss, lr)
+
+		// Upload updated weights back to GPU
+		syncWeights(&embedHW)
+		for li := range layHW {
+			syncWeights(&layHW[li].down)
+			syncWeights(&layHW[li].gate)
+			syncWeights(&layHW[li].up)
+			syncWeights(&layHW[li].wo)
+			syncWeights(&layHW[li].wq)
+			syncWeights(&layHW[li].wk)
+			syncWeights(&layHW[li].wv)
+		}
+
 		if step <= 3 || step%*logEvery == 0 {
 			elapsed := time.Since(t0)
 			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s)\n",
-				step, *stepsFlag, stepLoss, getLR(step), elapsed.Seconds(), float64(step)/elapsed.Seconds())
+				step, *stepsFlag, stepLoss, lr, elapsed.Seconds(), float64(step)/elapsed.Seconds())
 		}
 	}
 
