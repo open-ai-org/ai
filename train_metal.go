@@ -484,11 +484,13 @@ func cmdTrainMetal() {
 
 	// Phase timing accumulators
 	var tBatch, tFwd, tLoss, tObs, tBwd, tClip, tNeedle, tDequant, tImmune time.Duration
+	var stepStart time.Time
 
 	for step := 1; step <= *stepsFlag; step++ {
 		start := rng.Intn(len(data) - n - 1)
 		tokF := make([]float32, n)
 		targF := make([]float32, n)
+		stepStart = time.Now()
 		ph := time.Now()
 		for i := 0; i < n; i++ {
 			tokF[i] = math.Float32frombits(uint32(int32(data[start+i])))
@@ -670,7 +672,7 @@ func cmdTrainMetal() {
 		ph = time.Now()
 		mtl.FusedBegin()
 
-		mtl.FusedGemmF32TN(gradGPU, normedFinal, dEmbed, vocabSize, n, dim)
+		mtl.FusedGemmF32TNSparse(gradGPU, normedFinal, dEmbed, embedMask, vocabSize, n, dim)
 		mtl.FusedGemmF32NN(gradGPU, embed, dHidden, n, vocabSize, dim)
 
 		mtl.FusedRMSNormBwd(dHidden, hidden, finalNorm, finalScales, dScratch, n, dim)
@@ -679,9 +681,10 @@ func cmdTrainMetal() {
 		for li := nLayers - 1; li >= 0; li-- {
 			l := &lays[li]
 			b := &bufs[li]
+			lm := &layMasks[li]
 
 			mtl.FusedGemmF32NN(dHidden, l.down.live, b.dFfnMid, n, dim, ffnDim)
-			mtl.FusedGemmF32TN(dHidden, b.ffnMid, b.dWDown, dim, n, ffnDim)
+			mtl.FusedGemmF32TNSparse(dHidden, b.ffnMid, b.dWDown, lm.down, dim, n, ffnDim)
 
 			mtl.SiLUGateBackward(b.dFfnMid, b.gatePre, b.upOut, b.gateAct, b.dGate, b.dUp)
 
@@ -689,14 +692,14 @@ func cmdTrainMetal() {
 			mtl.FusedGemmF32NN(b.dUp, l.up.live, b.dx, n, ffnDim, dim)
 			mtl.FusedAddInPlace(b.dN2, b.dx, n*dim)
 
-			mtl.FusedGemmF32TN(b.dGate, b.normed2, b.dWGate, ffnDim, n, dim)
-			mtl.FusedGemmF32TN(b.dUp, b.normed2, b.dWUp, ffnDim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dGate, b.normed2, b.dWGate, lm.gate, ffnDim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dUp, b.normed2, b.dWUp, lm.up, ffnDim, n, dim)
 
 			mtl.FusedRMSNormBwd(b.dN2, b.xMid, l.norm2, b.rmsScale2, b.dx, n, dim)
 			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
 
 			mtl.FusedGemmF32NN(dHidden, l.wo.live, b.dAttnOut, n, dim, dim)
-			mtl.FusedGemmF32TN(dHidden, b.attnOut, b.dWO, dim, n, dim)
+			mtl.FusedGemmF32TNSparse(dHidden, b.attnOut, b.dWO, lm.wo, dim, n, dim)
 
 			mtl.FusedAttentionBwdQ(b.dAttnOut, b.Q, b.K, b.V, scores,
 				b.dQ, b.dK, b.dV, dim, kvDim, headDim, heads, kvHeads, n, n)
@@ -710,9 +713,9 @@ func cmdTrainMetal() {
 			mtl.FusedAddInPlace(b.dN1, b.dx, n*dim)
 			mtl.FusedAddInPlace(b.dN1, b.dN2, n*dim)
 
-			mtl.FusedGemmF32TN(b.dQ, b.normed, b.dWQ, dim, n, dim)
-			mtl.FusedGemmF32TN(b.dK, b.normed, b.dWK, kvDim, n, dim)
-			mtl.FusedGemmF32TN(b.dV, b.normed, b.dWV, kvDim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dQ, b.normed, b.dWQ, lm.wq, dim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dK, b.normed, b.dWK, lm.wk, kvDim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dV, b.normed, b.dWV, lm.wv, kvDim, n, dim)
 
 			mtl.FusedRMSNormBwd(b.dN1, b.xIn, l.norm1, b.rmsScale1, b.dx, n, dim)
 			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
@@ -829,10 +832,12 @@ func cmdTrainMetal() {
 		mtl.FusedEnd()
 		tDequant += time.Since(ph)
 
+		stepDur := time.Since(stepStart)
 		if step <= 3 || step%*logEvery == 0 || step == *stepsFlag {
 			elapsed := time.Since(t0)
-			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  floor=%.3f  %.0fs  (%.1f steps/s)\n",
-				step, *stepsFlag, stepLoss, curLR, bestFloor, elapsed.Seconds(), float64(step)/elapsed.Seconds())
+			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  floor=%.3f  %.0fs  (%.1f avg, %.1f this)\n",
+				step, *stepsFlag, stepLoss, curLR, bestFloor, elapsed.Seconds(),
+				float64(step)/elapsed.Seconds(), 1.0/stepDur.Seconds())
 		}
 		_ = r
 	}
