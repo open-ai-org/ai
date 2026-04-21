@@ -245,6 +245,7 @@ func cmdTrainMetal() {
 	dHidden := te.Zeros([]int{n, dim})
 	dScratch := te.Zeros([]int{n, dim})
 	gradSumSq := te.Zeros([]int{1})
+	clipScaleBuf := te.Zeros([]int{1})
 	const gradMaxNorm = float32(1.0)
 
 	// Forward activations — double-buffered for coiled pipeline.
@@ -696,7 +697,7 @@ func cmdTrainMetal() {
 			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
 		}
 
-		// --- GRAD CLIPPING ---
+		// --- GRAD NORM → CLIP SCALE (GPU) → NEEDLE (with built-in clip + dequant) ---
 		mtl.FusedZeroScalar(gradSumSq)
 		mtl.FusedBarrierBuffers()
 		for li := range lays {
@@ -710,30 +711,28 @@ func cmdTrainMetal() {
 			mtl.FusedGradNormSq(b.dWDown, gradSumSq, b.dWDown.Size)
 		}
 		mtl.FusedBarrierBuffers()
-		for li := range lays {
-			b := &bwds[li]
-			mtl.FusedGradClipScale(b.dWQ, gradSumSq, gradMaxNorm, b.dWQ.Size)
-			mtl.FusedGradClipScale(b.dWK, gradSumSq, gradMaxNorm, b.dWK.Size)
-			mtl.FusedGradClipScale(b.dWV, gradSumSq, gradMaxNorm, b.dWV.Size)
-			mtl.FusedGradClipScale(b.dWO, gradSumSq, gradMaxNorm, b.dWO.Size)
-			mtl.FusedGradClipScale(b.dWGate, gradSumSq, gradMaxNorm, b.dWGate.Size)
-			mtl.FusedGradClipScale(b.dWUp, gradSumSq, gradMaxNorm, b.dWUp.Size)
-			mtl.FusedGradClipScale(b.dWDown, gradSumSq, gradMaxNorm, b.dWDown.Size)
-		}
+		mtl.FusedComputeClipScale(gradSumSq, clipScaleBuf, gradMaxNorm)
 		mtl.FusedBarrierBuffers()
 
-		// --- NEEDLE OPTIMIZER ---
 		const beta1 = float32(0.9)
 		const beta2 = float32(0.95)
 		const eps = float32(1e-8)
 		const wd = float32(0.1)
 		bondGC := float32(3.0 / 5.0)
 		bondAT := float32(2.0 / 5.0)
+		// clipScaleBuf[0] is now on GPU — needle reads it via the live+clipScale shader args.
+		// But the shader takes clipScale as a constant, not a buffer. We need to read it.
+		// Actually the shader uses setBytes for clipScale — we can't pass a buffer.
+		// Solution: end encoder, read from shared memory, restart. One sync point.
+		mtl.FusedEnd()
+		clipScale := mtl.SharedSlice(clipScaleBuf)[0]
+		mtl.FusedBegin()
 
 		needleSingle := func(p int8Param, grad *mongoose.Tensor, mask *mongoose.HotRowMask) {
 			mtl.FusedNeedle(p.data, p.scales, grad,
 				p.mom, p.vel, mask, p.delta,
-				curLR, beta1, beta2, bc1, bc2, eps, wd, p.data.Size, p.cols)
+				curLR, beta1, beta2, bc1, bc2, eps, wd, p.data.Size, p.cols,
+				p.live, clipScale)
 		}
 
 		for li := range lays {
@@ -747,7 +746,7 @@ func cmdTrainMetal() {
 				lm.gate, l.gate.delta, l.up.delta,
 				curLR, beta1, beta2, bc1, bc2, eps, wd,
 				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-				bondGC, l.gate.data.Size, dim)
+				bondGC, l.gate.data.Size, dim, l.gate.live, l.up.live, clipScale)
 
 			if l.wq.data.Size == l.wk.data.Size {
 				mtl.FusedNeedlePaired(
@@ -756,7 +755,7 @@ func cmdTrainMetal() {
 					lm.wq, l.wq.delta, l.wk.delta,
 					curLR, beta1, beta2, bc1, bc2, eps, wd,
 					r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-					bondAT, l.wq.data.Size, dim)
+					bondAT, l.wq.data.Size, dim, l.wq.live, l.wk.live, clipScale)
 			} else {
 				needleSingle(l.wq, b.dWQ, lm.wq)
 				needleSingle(l.wk, b.dWK, lm.wk)
@@ -769,21 +768,6 @@ func cmdTrainMetal() {
 
 		needleSingle(int8Param{data: embedData, scales: embedScales, delta: embedDelta, mom: embedMom, vel: embedVel, live: embed, rows: vocabSize, cols: dim},
 			dEmbed, embedMask)
-
-		// --- SPARSE DEQUANT ---
-		mtl.FusedBarrierBuffers()
-		for li := range lays {
-			l := &lays[li]
-			lm := &layMasks[li]
-			mtl.FusedDequantDeltaSparse(l.wq.data, l.wq.scales, l.wq.delta, l.wq.live, lm.wq, l.wq.data.Size, l.wq.cols)
-			mtl.FusedDequantDeltaSparse(l.wk.data, l.wk.scales, l.wk.delta, l.wk.live, lm.wk, l.wk.data.Size, l.wk.cols)
-			mtl.FusedDequantDeltaSparse(l.wv.data, l.wv.scales, l.wv.delta, l.wv.live, lm.wv, l.wv.data.Size, l.wv.cols)
-			mtl.FusedDequantDeltaSparse(l.wo.data, l.wo.scales, l.wo.delta, l.wo.live, lm.wo, l.wo.data.Size, l.wo.cols)
-			mtl.FusedDequantDeltaSparse(l.gate.data, l.gate.scales, l.gate.delta, l.gate.live, lm.gate, l.gate.data.Size, l.gate.cols)
-			mtl.FusedDequantDeltaSparse(l.up.data, l.up.scales, l.up.delta, l.up.live, lm.up, l.up.data.Size, l.up.cols)
-			mtl.FusedDequantDeltaSparse(l.down.data, l.down.scales, l.down.delta, l.down.live, lm.down, l.down.data.Size, l.down.cols)
-		}
-		mtl.FusedDequantDeltaSparse(embedData, embedScales, embedDelta, embed, embedMask, embedData.Size, dim)
 
 		mtl.FusedEnd()
 		tFwd += time.Since(ph)
