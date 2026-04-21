@@ -720,19 +720,11 @@ func cmdTrainMetal() {
 		const wd = float32(0.1)
 		bondGC := float32(3.0 / 5.0)
 		bondAT := float32(2.0 / 5.0)
-		// clipScaleBuf[0] is now on GPU — needle reads it via the live+clipScale shader args.
-		// But the shader takes clipScale as a constant, not a buffer. We need to read it.
-		// Actually the shader uses setBytes for clipScale — we can't pass a buffer.
-		// Solution: end encoder, read from shared memory, restart. One sync point.
-		mtl.FusedEnd()
-		clipScale := mtl.SharedSlice(clipScaleBuf)[0]
-		mtl.FusedBegin()
-
 		needleSingle := func(p int8Param, grad *mongoose.Tensor, mask *mongoose.HotRowMask) {
 			mtl.FusedNeedle(p.data, p.scales, grad,
 				p.mom, p.vel, mask, p.delta,
 				curLR, beta1, beta2, bc1, bc2, eps, wd, p.data.Size, p.cols,
-				p.live, clipScale)
+				p.live, clipScaleBuf)
 		}
 
 		for li := range lays {
@@ -746,7 +738,7 @@ func cmdTrainMetal() {
 				lm.gate, l.gate.delta, l.up.delta,
 				curLR, beta1, beta2, bc1, bc2, eps, wd,
 				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-				bondGC, l.gate.data.Size, dim, l.gate.live, l.up.live, clipScale)
+				bondGC, l.gate.data.Size, dim, l.gate.live, l.up.live, clipScaleBuf)
 
 			if l.wq.data.Size == l.wk.data.Size {
 				mtl.FusedNeedlePaired(
@@ -755,7 +747,7 @@ func cmdTrainMetal() {
 					lm.wq, l.wq.delta, l.wk.delta,
 					curLR, beta1, beta2, bc1, bc2, eps, wd,
 					r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-					bondAT, l.wq.data.Size, dim, l.wq.live, l.wk.live, clipScale)
+					bondAT, l.wq.data.Size, dim, l.wq.live, l.wk.live, clipScaleBuf)
 			} else {
 				needleSingle(l.wq, b.dWQ, lm.wq)
 				needleSingle(l.wk, b.dWK, lm.wk)
