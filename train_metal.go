@@ -482,10 +482,14 @@ func cmdTrainMetal() {
 	tokIDs := make([]int32, n)
 	var prevLoss float32
 
+	// Phase timing accumulators
+	var tBatch, tFwd, tLoss, tObs, tBwd, tClip, tNeedle, tDequant, tImmune time.Duration
+
 	for step := 1; step <= *stepsFlag; step++ {
 		start := rng.Intn(len(data) - n - 1)
 		tokF := make([]float32, n)
 		targF := make([]float32, n)
+		ph := time.Now()
 		for i := 0; i < n; i++ {
 			tokF[i] = math.Float32frombits(uint32(int32(data[start+i])))
 			targF[i] = math.Float32frombits(uint32(int32(data[start+i+1])))
@@ -499,8 +503,10 @@ func cmdTrainMetal() {
 			tokID := data[start+i]
 			copy(hiddenShared[i*dim:(i+1)*dim], embedShared[tokID*dim:(tokID+1)*dim])
 		}
+		tBatch += time.Since(ph)
 
 		// === FORWARD ===
+		ph = time.Now()
 		mtl.FusedBegin()
 
 		for li := range lays {
@@ -543,10 +549,13 @@ func cmdTrainMetal() {
 		mtl.FusedGemmF32BT(normedFinal, embed, logitsBuf, n, dim, vocabSize)
 
 		mtl.FusedEnd()
+		tFwd += time.Since(ph)
 
+		ph = time.Now()
 		stepLoss := cpuSoftmaxCEGrad()
+		tLoss += time.Since(ph)
 
-		// === Sparse immune system ===
+		ph = time.Now()
 		hotRows := conductor.HotRows()
 
 		if !immuneActive && step > 1 && stepLoss > 0 {
@@ -603,6 +612,8 @@ func cmdTrainMetal() {
 		prevLoss = stepLoss
 		curLR = stepLR
 
+		tImmune += time.Since(ph)
+
 		if immuneSkip {
 			continue
 		}
@@ -617,6 +628,7 @@ func cmdTrainMetal() {
 			continue
 		}
 
+		ph = time.Now()
 		// === Projection tracker observation ===
 		for li := range lays {
 			b := &bufs[li]
@@ -641,6 +653,8 @@ func cmdTrainMetal() {
 			layMasks[li].down.Set(layTrk[li].down.HotRows())
 		}
 
+		tObs += time.Since(ph)
+
 		// === Helix rung geometry ===
 		r, bc1, bc2, rewound := hlx.PrepareStep(step, stepLoss, curLR)
 		if rewound {
@@ -652,7 +666,8 @@ func cmdTrainMetal() {
 			continue
 		}
 
-		// === BACKWARD + GRAD CLIPPING + NEEDLE OPTIMIZER ===
+		// === BACKWARD ===
+		ph = time.Now()
 		mtl.FusedBegin()
 
 		mtl.FusedGemmF32TN(gradGPU, normedFinal, dEmbed, vocabSize, n, dim)
@@ -705,7 +720,12 @@ func cmdTrainMetal() {
 
 		// No pre-clip diagnostic
 
+		mtl.FusedEnd()
+		tBwd += time.Since(ph)
+
 		// === GPU gradient clipping ===
+		ph = time.Now()
+		mtl.FusedBegin()
 		mtl.FusedZeroScalar(gradSumSq)
 		mtl.FusedBarrierBuffers()
 		for li := range lays {
@@ -733,7 +753,12 @@ func cmdTrainMetal() {
 		mtl.FusedGradClipScale(dEmbed, gradSumSq, gradMaxNorm, dEmbed.Size)
 		mtl.FusedBarrierBuffers()
 
+		mtl.FusedEnd()
+		tClip += time.Since(ph)
+
 		// === NEEDLE optimizer ===
+		ph = time.Now()
+		mtl.FusedBegin()
 		const beta1 = float32(0.9)
 		const beta2 = float32(0.95)
 		const eps = float32(1e-8)
@@ -781,21 +806,28 @@ func cmdTrainMetal() {
 		needleSingle(int8Param{data: embedData, scales: embedScales, delta: embedDelta, mom: embedMom, vel: embedVel, live: embed, rows: vocabSize, cols: dim},
 			dEmbed, embedMask)
 
-		// === Dequant INT8+delta → FP32 live weights ===
+		mtl.FusedEnd()
+		tNeedle += time.Since(ph)
+
+		// === Sparse dequant: only re-dequant rows needle touched ===
+		ph = time.Now()
+		mtl.FusedBegin()
 		mtl.FusedBarrierBuffers()
 		for li := range lays {
 			l := &lays[li]
-			mtl.FusedDequantDelta(l.wq.data, l.wq.scales, l.wq.delta, l.wq.live, l.wq.data.Size, l.wq.cols)
-			mtl.FusedDequantDelta(l.wk.data, l.wk.scales, l.wk.delta, l.wk.live, l.wk.data.Size, l.wk.cols)
-			mtl.FusedDequantDelta(l.wv.data, l.wv.scales, l.wv.delta, l.wv.live, l.wv.data.Size, l.wv.cols)
-			mtl.FusedDequantDelta(l.wo.data, l.wo.scales, l.wo.delta, l.wo.live, l.wo.data.Size, l.wo.cols)
-			mtl.FusedDequantDelta(l.gate.data, l.gate.scales, l.gate.delta, l.gate.live, l.gate.data.Size, l.gate.cols)
-			mtl.FusedDequantDelta(l.up.data, l.up.scales, l.up.delta, l.up.live, l.up.data.Size, l.up.cols)
-			mtl.FusedDequantDelta(l.down.data, l.down.scales, l.down.delta, l.down.live, l.down.data.Size, l.down.cols)
+			lm := &layMasks[li]
+			mtl.FusedDequantDeltaSparse(l.wq.data, l.wq.scales, l.wq.delta, l.wq.live, lm.wq, l.wq.data.Size, l.wq.cols)
+			mtl.FusedDequantDeltaSparse(l.wk.data, l.wk.scales, l.wk.delta, l.wk.live, lm.wk, l.wk.data.Size, l.wk.cols)
+			mtl.FusedDequantDeltaSparse(l.wv.data, l.wv.scales, l.wv.delta, l.wv.live, lm.wv, l.wv.data.Size, l.wv.cols)
+			mtl.FusedDequantDeltaSparse(l.wo.data, l.wo.scales, l.wo.delta, l.wo.live, lm.wo, l.wo.data.Size, l.wo.cols)
+			mtl.FusedDequantDeltaSparse(l.gate.data, l.gate.scales, l.gate.delta, l.gate.live, lm.gate, l.gate.data.Size, l.gate.cols)
+			mtl.FusedDequantDeltaSparse(l.up.data, l.up.scales, l.up.delta, l.up.live, lm.up, l.up.data.Size, l.up.cols)
+			mtl.FusedDequantDeltaSparse(l.down.data, l.down.scales, l.down.delta, l.down.live, lm.down, l.down.data.Size, l.down.cols)
 		}
-		mtl.FusedDequantDelta(embedData, embedScales, embedDelta, embed, embedData.Size, dim)
+		mtl.FusedDequantDeltaSparse(embedData, embedScales, embedDelta, embed, embedMask, embedData.Size, dim)
 
 		mtl.FusedEnd()
+		tDequant += time.Since(ph)
 
 		if step <= 3 || step%*logEvery == 0 || step == *stepsFlag {
 			elapsed := time.Since(t0)
@@ -809,6 +841,19 @@ func cmdTrainMetal() {
 	total := time.Since(t0)
 	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)  floor=%.3f\n",
 		*stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds(), bestFloor)
+	fmt.Printf("\nphase breakdown (wall time, includes GPU wait):\n")
+	all := tBatch + tFwd + tLoss + tImmune + tObs + tBwd + tClip + tNeedle + tDequant
+	pct := func(d time.Duration) string { return fmt.Sprintf("%.1f%%", float64(d)/float64(all)*100) }
+	fmt.Printf("  batch:   %6.1fms  %s\n", float64(tBatch.Microseconds())/1000, pct(tBatch))
+	fmt.Printf("  forward: %6.1fms  %s\n", float64(tFwd.Microseconds())/1000, pct(tFwd))
+	fmt.Printf("  loss:    %6.1fms  %s\n", float64(tLoss.Microseconds())/1000, pct(tLoss))
+	fmt.Printf("  immune:  %6.1fms  %s\n", float64(tImmune.Microseconds())/1000, pct(tImmune))
+	fmt.Printf("  observe: %6.1fms  %s\n", float64(tObs.Microseconds())/1000, pct(tObs))
+	fmt.Printf("  bwd:     %6.1fms  %s\n", float64(tBwd.Microseconds())/1000, pct(tBwd))
+	fmt.Printf("  clip:    %6.1fms  %s\n", float64(tClip.Microseconds())/1000, pct(tClip))
+	fmt.Printf("  needle:  %6.1fms  %s\n", float64(tNeedle.Microseconds())/1000, pct(tNeedle))
+	fmt.Printf("  dequant: %6.1fms  %s\n", float64(tDequant.Microseconds())/1000, pct(tDequant))
+	fmt.Printf("  total:   %6.1fms\n", float64(all.Microseconds())/1000)
 
 	saveFullCheckpoint(*stepsFlag, bestFloor)
 	embedMask.Release()
