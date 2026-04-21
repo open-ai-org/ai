@@ -13,6 +13,8 @@ import (
 	"time"
 	"unsafe"
 
+	"encoding/json"
+
 	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/helix"
 	"github.com/open-ai-org/mongoose"
@@ -22,6 +24,7 @@ func cmdTrainMetal() {
 	fs := flag.NewFlagSet("train-metal", flag.ExitOnError)
 
 	dataPath := fs.String("data", "", "Training data (text file)")
+	resumePath := fs.String("resume", "", "Resume from checkpoint directory")
 	dimFlag := fs.Int("dim", 128, "Model dimension")
 	headsFlag := fs.Int("heads", 4, "Attention heads")
 	kvHeadsFlag := fs.Int("kv-heads", 2, "KV heads (GQA)")
@@ -33,6 +36,41 @@ func cmdTrainMetal() {
 	logEvery := fs.Int("log-every", 100, "Log every N steps")
 
 	fs.Parse(os.Args[2:])
+
+	// Resume: load model shape from checkpoint config
+	var resumeST *gguf.SafeTensors
+	if *resumePath != "" {
+		ckptDir := *resumePath
+		if _, err := os.Stat(filepath.Join(ckptDir, "config.json")); err != nil {
+			latest := findLatestCheckpoint(ckptDir)
+			if latest == "" {
+				log.Fatalf("No checkpoint found in %s", ckptDir)
+			}
+			ckptDir = latest
+		}
+		cfgData, err := os.ReadFile(filepath.Join(ckptDir, "config.json"))
+		if err != nil {
+			log.Fatalf("No config.json in %s", ckptDir)
+		}
+		var cfg map[string]interface{}
+		json.Unmarshal(cfgData, &cfg)
+		getInt := func(key string, def int) int {
+			if v, ok := cfg[key].(float64); ok { return int(v) }
+			return def
+		}
+		*dimFlag = getInt("hidden_size", *dimFlag)
+		*layersFlag = getInt("num_hidden_layers", *layersFlag)
+		*headsFlag = getInt("num_attention_heads", *headsFlag)
+		*kvHeadsFlag = getInt("num_key_value_heads", *kvHeadsFlag)
+		*ffnDimFlag = getInt("intermediate_size", *ffnDimFlag)
+
+		stPath := filepath.Join(ckptDir, "model.safetensors")
+		resumeST, err = gguf.OpenSafeTensors(stPath)
+		if err != nil {
+			log.Fatalf("Load checkpoint: %v", err)
+		}
+		fmt.Printf("Resuming from %s (dim=%d layers=%d)\n", ckptDir, *dimFlag, *layersFlag)
+	}
 
 	if *dataPath == "" {
 		*dataPath = "data/tinystories_hf.txt"
@@ -131,7 +169,14 @@ func cmdTrainMetal() {
 		return
 	}
 
-	kaiming := func(rows, cols int) []float32 {
+	loadOrInit := func(name string, rows, cols int) []float32 {
+		if resumeST != nil && resumeST.HasTensor(name) {
+			data, _, err := resumeST.ReadTensorFloat32(name)
+			if err == nil && len(data) == rows*cols {
+				return data
+			}
+			log.Printf("[resume] warning: %s load failed, using random init", name)
+		}
 		bound := float32(math.Sqrt(2.0 / float64(cols)))
 		d := make([]float32, rows*cols)
 		for i := range d {
@@ -139,7 +184,13 @@ func cmdTrainMetal() {
 		}
 		return d
 	}
-	ones := func(sz int) *mongoose.Tensor {
+	loadOrOnes := func(name string, sz int) *mongoose.Tensor {
+		if resumeST != nil && resumeST.HasTensor(name) {
+			data, _, err := resumeST.ReadTensorFloat32(name)
+			if err == nil && len(data) == sz {
+				return te.FromHost(data, []int{1, sz})
+			}
+		}
 		d := make([]float32, sz)
 		for i := range d {
 			d[i] = 1.0
@@ -158,8 +209,8 @@ func cmdTrainMetal() {
 		cols   int
 	}
 
-	makeInt8Param := func(rows, cols int) int8Param {
-		fp32 := kaiming(rows, cols)
+	makeInt8Param := func(name string, rows, cols int) int8Param {
+		fp32 := loadOrInit(name, rows, cols)
 		i8, sc, dl := quantizeToInt8(fp32, rows, cols)
 		nElems := rows * cols
 
@@ -175,10 +226,7 @@ func cmdTrainMetal() {
 		return int8Param{data: dataT, scales: scalesT, delta: deltaT, mom: momT, vel: velT, live: liveT, rows: rows, cols: cols}
 	}
 
-	embedFP32 := make([]float32, vocabSize*dim)
-	for i := range embedFP32 {
-		embedFP32[i] = float32(rand.NormFloat64()) * 0.02
-	}
+	embedFP32 := loadOrInit("model.embed_tokens.weight", vocabSize, dim)
 	embedI8, embedSc, embedDl := quantizeToInt8(embedFP32, vocabSize, dim)
 
 	embedData := mtl.AllocRaw(vocabSize*dim, vocabSize*dim, []int{vocabSize, dim})
@@ -189,7 +237,7 @@ func cmdTrainMetal() {
 	embedVel := mtl.AllocRaw(vocabSize*dim*2, vocabSize*dim, []int{vocabSize, dim})
 	embed := te.FromHost(embedFP32, []int{vocabSize, dim})
 
-	finalNorm := ones(dim)
+	finalNorm := loadOrOnes("model.norm.weight", dim)
 
 	type layer struct {
 		wq, wk, wv, wo, gate, up, down int8Param
@@ -197,12 +245,17 @@ func cmdTrainMetal() {
 	}
 	lays := make([]layer, nLayers)
 	for l := range lays {
+		pfx := fmt.Sprintf("model.layers.%d.", l)
 		lays[l] = layer{
-			wq: makeInt8Param(dim, dim), wk: makeInt8Param(kvDim, dim),
-			wv: makeInt8Param(kvDim, dim), wo: makeInt8Param(dim, dim),
-			gate: makeInt8Param(ffnDim, dim), up: makeInt8Param(ffnDim, dim),
-			down: makeInt8Param(dim, ffnDim),
-			norm1: ones(dim), norm2: ones(dim),
+			wq:    makeInt8Param(pfx+"self_attn.q_proj.weight", dim, dim),
+			wk:    makeInt8Param(pfx+"self_attn.k_proj.weight", kvDim, dim),
+			wv:    makeInt8Param(pfx+"self_attn.v_proj.weight", kvDim, dim),
+			wo:    makeInt8Param(pfx+"self_attn.o_proj.weight", dim, dim),
+			gate:  makeInt8Param(pfx+"mlp.gate_proj.weight", ffnDim, dim),
+			up:    makeInt8Param(pfx+"mlp.up_proj.weight", ffnDim, dim),
+			down:  makeInt8Param(pfx+"mlp.down_proj.weight", dim, ffnDim),
+			norm1: loadOrOnes(pfx+"input_layernorm.weight", dim),
+			norm2: loadOrOnes(pfx+"post_attention_layernorm.weight", dim),
 		}
 	}
 
