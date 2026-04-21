@@ -9,12 +9,15 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/mongoose"
 )
 
+// cmdTrain discovers all available compute backends, benchmarks them,
+// and routes to the fastest one.
 func cmdTrain() {
 	fs := flag.NewFlagSet("train", flag.ExitOnError)
 
@@ -29,6 +32,7 @@ func cmdTrain() {
 	lrFlag := fs.Float64("lr", 6e-4, "Learning rate")
 	logEvery := fs.Int("log-every", 100, "Log every N steps")
 	saveDir := fs.String("save-dir", "", "Save directory")
+	backend := fs.String("backend", "auto", "Training backend: auto, graph, cuda, cpu")
 
 	fs.Parse(os.Args[2:])
 
@@ -44,207 +48,135 @@ func cmdTrain() {
 		*saveDir = filepath.Join(home, ".ai", "models", "train-out")
 	}
 
-	eng := selectEngine("auto")
-	graph := mongoose.AsGraphTrainEngine(eng)
-	if graph == nil {
-		log.Fatal("GraphTrainEngine not available on this backend. Need Metal (MPSGraph) or CUDA graph support.")
-	}
-
-	dim := *dimFlag
-	heads := *headsFlag
-	kvHeads := *kvHeadsFlag
-	headDim := dim / heads
-	kvDim := kvHeads * headDim
-	nLayers := *layersFlag
-	ffnDim := *ffnDimFlag
-	seqLen := *seqLenFlag
-	vocabSize := 256
-	ropeTheta := 10000.0
 	lr := float32(*lrFlag)
 
-	raw, err := os.ReadFile(*dataPath)
-	if err != nil {
-		log.Fatalf("read data: %v", err)
-	}
-	data := make([]int, len(raw))
-	for i, b := range raw {
-		data[i] = int(b)
-	}
-
-	nParams := vocabSize*dim + dim
-	for range nLayers {
-		nParams += dim                     // norm1
-		nParams += dim*dim + dim           // wq + bq
-		nParams += kvDim*dim + kvDim       // wk + bk
-		nParams += kvDim*dim + kvDim       // wv + bv
-		nParams += dim * dim               // wo
-		nParams += dim                     // norm2
-		nParams += ffnDim * dim * 2        // gate + up
-		nParams += dim * ffnDim            // down
+	rewriteForSub := func() {
+		os.Args = []string{os.Args[0], "train",
+			"-data", *dataPath,
+			"-dim", fmt.Sprintf("%d", *dimFlag),
+			"-heads", fmt.Sprintf("%d", *headsFlag),
+			"-kv-heads", fmt.Sprintf("%d", *kvHeadsFlag),
+			"-layers", fmt.Sprintf("%d", *layersFlag),
+			"-ffn-dim", fmt.Sprintf("%d", *ffnDimFlag),
+			"-seq-len", fmt.Sprintf("%d", *seqLenFlag),
+			"-steps", fmt.Sprintf("%d", *stepsFlag),
+			"-lr", fmt.Sprintf("%e", *lrFlag),
+			"-log-every", fmt.Sprintf("%d", *logEvery),
+		}
 	}
 
-	fmt.Println("ai train — from scratch via GraphTrainEngine")
-	fmt.Printf("  engine:   %s\n", eng.Name())
-	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
-	fmt.Printf("  model:    dim=%d heads=%d kv=%d layers=%d ffn=%d seq=%d vocab=%d\n",
-		dim, heads, kvHeads, nLayers, ffnDim, seqLen, vocabSize)
-	if nParams > 1_000_000 {
-		fmt.Printf("  params:   %.2fM\n", float64(nParams)/1e6)
+	if *backend != "auto" {
+		switch *backend {
+		case "graph":
+			cmdTrainGraph(*dataPath, *dimFlag, *headsFlag, *kvHeadsFlag, *layersFlag, *ffnDimFlag,
+				*seqLenFlag, 256, *stepsFlag, lr, *logEvery, *saveDir)
+		case "cuda":
+			rewriteForSub()
+			cmdTrainCUDA()
+		case "cpu":
+			rewriteForSub()
+			cmdTrainAny()
+		default:
+			log.Fatalf("unknown backend: %s (use auto, graph, cuda, cpu)", *backend)
+		}
+		return
+	}
+
+	// Auto mode: discover, benchmark, pick fastest
+	type candidate struct {
+		name    string
+		engine  mongoose.Engine
+		gflops  float64
+		hasGraph bool
+		hasCUDA  bool
+	}
+
+	var candidates []candidate
+
+	// Probe Metal
+	if runtime.GOOS == "darwin" {
+		if m := mongoose.NewMetal(); m != nil {
+			gf := m.Benchmark()
+			candidates = append(candidates, candidate{
+				name: m.Name(), engine: m, gflops: gf,
+				hasGraph: mongoose.AsGraphTrainEngine(m) != nil,
+			})
+		}
+	}
+
+	// Probe CUDA
+	if c := mongoose.NewCUDA(); c != nil {
+		mongoose.LoadKernels()
+		gf := c.Benchmark()
+		candidates = append(candidates, candidate{
+			name: c.Name(), engine: c, gflops: gf,
+			hasCUDA: mongoose.KernelsLoaded(),
+			hasGraph: mongoose.AsGraphTrainEngine(c) != nil,
+		})
+	}
+
+	// CPU always available
+	cpu := &mongoose.CPU{}
+	candidates = append(candidates, candidate{
+		name: cpu.Name(), engine: cpu, gflops: cpu.Benchmark(),
+	})
+
+	// Pick: prefer graph engine on fastest GPU, then CUDA kernels, then CPU
+	fmt.Println("ai train — auto-selecting backend")
+	for _, c := range candidates {
+		marker := " "
+		if c.hasGraph { marker = "⚡" }
+		if c.hasCUDA { marker = "🔥" }
+		fmt.Printf("  %s %-30s %.0f GFLOPS", marker, c.name, c.gflops)
+		if c.hasGraph { fmt.Print("  (graph)") }
+		if c.hasCUDA { fmt.Print("  (kernels)") }
+		fmt.Println()
+	}
+
+	// Strategy: CUDA kernels > graph engine > CPU, weighted by GFLOPS
+	var bestGraph, bestCUDA, bestCPU *candidate
+	for i := range candidates {
+		c := &candidates[i]
+		if c.hasCUDA && (bestCUDA == nil || c.gflops > bestCUDA.gflops) {
+			bestCUDA = c
+		}
+		if c.hasGraph && (bestGraph == nil || c.gflops > bestGraph.gflops) {
+			bestGraph = c
+		}
+		if !c.hasCUDA && !c.hasGraph {
+			if bestCPU == nil || c.gflops > bestCPU.gflops {
+				bestCPU = c
+			}
+		}
+	}
+
+	// CUDA kernels path gets helix DNA optimizer — prefer it if available
+	if bestCUDA != nil {
+		fmt.Printf("\n  → %s (CUDA kernels + helix DNA optimizer)\n\n", bestCUDA.name)
+		rewriteForSub()
+		cmdTrainCUDA()
+		return
+	}
+
+	// GraphTrainEngine (Metal MPSGraph or CUDA graph)
+	if bestGraph != nil {
+		fmt.Printf("\n  → %s (fused graph dispatch)\n\n", bestGraph.name)
+		cmdTrainGraph(*dataPath, *dimFlag, *headsFlag, *kvHeadsFlag, *layersFlag, *ffnDimFlag,
+			*seqLenFlag, 256, *stepsFlag, lr, *logEvery, *saveDir)
+		return
+	}
+
+	// CPU fallback
+	if bestCPU != nil {
+		fmt.Printf("\n  → %s (CPU fallback)\n\n", bestCPU.name)
 	} else {
-		fmt.Printf("  params:   %.1fK\n", float64(nParams)/1e3)
+		fmt.Printf("\n  → CPU fallback\n\n")
 	}
-	fmt.Printf("  training: steps=%d lr=%.0e log_every=%d\n", *stepsFlag, *lrFlag, *logEvery)
-	fmt.Println()
-
-	ret := graph.BuildFullGraph(dim, kvDim, headDim, heads, kvHeads, ffnDim,
-		vocabSize, nLayers, seqLen, ropeTheta, 1)
-	if ret != 0 {
-		log.Fatalf("BuildFullGraph failed: %d", ret)
-	}
-
-	kaiming := func(rows, cols int) []float32 {
-		bound := float32(math.Sqrt(2.0 / float64(cols)))
-		d := make([]float32, rows*cols)
-		for i := range d {
-			d[i] = bound * (2*rand.Float32() - 1)
-		}
-		return d
-	}
-	ones := func(n int) []float32 {
-		s := make([]float32, n)
-		for i := range s { s[i] = 1.0 }
-		return s
-	}
-	zeros := func(n int) []float32 {
-		return make([]float32, n)
-	}
-
-	nW := graph.GraphNumWeights()
-
-	embed := make([]float32, vocabSize*dim)
-	for i := range embed {
-		embed[i] = float32(rand.NormFloat64()) * 0.02
-	}
-
-	var paramData [][]float32
-	paramData = append(paramData, embed)
-	paramData = append(paramData, ones(dim))
-
-	for range nLayers {
-		paramData = append(paramData,
-			ones(dim),                     // norm1
-			kaiming(dim, dim),             // wq
-			kaiming(kvDim, dim),           // wk
-			kaiming(kvDim, dim),           // wv
-			kaiming(dim, dim),             // wo
-			zeros(dim),                    // bq
-			zeros(kvDim),                  // bk
-			zeros(kvDim),                  // bv
-			ones(dim),                     // norm2
-			kaiming(ffnDim, dim),          // gate
-			kaiming(ffnDim, dim),          // up
-			kaiming(dim, ffnDim),          // down
-		)
-	}
-
-	if len(paramData) != nW {
-		log.Fatalf("weight count mismatch: have %d, graph expects %d", len(paramData), nW)
-	}
-
-	fmt.Print("Initializing graph variables... ")
-	for i := 0; i < nW; i++ {
-		graph.GraphSetVariable(i, paramData[i])
-	}
-	graph.Sync()
-	fmt.Println("done")
-
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	n := seqLen + 1
-
-	graph.Sync()
-	fmt.Println("Training...")
-	t0 := time.Now()
-
-	// Immune system for GraphTrainEngine: can't undo weight updates,
-	// but can zero LR on rebound (next step = no-op update)
-	bestFloor := float32(1e30)
-	immuneActive := false
-	floorContactStep := 0
-	floorWindow := 10
-	maxRecoveries := 20
-	recoveryCount := 0
-	baseLR := float32(*lrFlag)
-
-	var prevLoss float32
-	for step := 1; step <= *stepsFlag; step++ {
-		start := rng.Intn(len(data) - n - 1)
-
-		tokens := make([]int32, n)
-		targets := make([]int32, n)
-		for i := 0; i < n; i++ {
-			tokens[i] = int32(data[start+i])
-			targets[i] = int32(data[start+i+1])
-		}
-
-		loss := graph.GraphTrainStepAdam(tokens, targets, lr)
-
-		// Floor detection
-		if loss > 0 && loss < bestFloor {
-			bestFloor = loss
-			if !immuneActive {
-				immuneActive = true
-				floorContactStep = step
-				recoveryCount = 0
-			}
-		}
-
-		// Immune monitoring: zero LR on rebound
-		if immuneActive && step-floorContactStep >= floorWindow {
-			rebound := loss - bestFloor
-			threshold := bestFloor * 0.05
-			if rebound > threshold && recoveryCount < maxRecoveries {
-				lr = 0 // next step is a no-op
-				recoveryCount++
-				immuneActive = false
-				fmt.Printf("step %5d  [IMMUNE → floor %.3f]\n", step, bestFloor)
-			} else {
-				immuneActive = false
-			}
-		}
-
-		// Signal-driven LR dampening
-		if step > 1 && prevLoss > 0 {
-			dLoss := float64(loss) - float64(prevLoss)
-			if dLoss > 0 {
-				ratio := float32(dLoss / math.Max(float64(prevLoss), 1e-6))
-				if ratio > 1.0 { ratio = 1.0 }
-				lr = baseLR * (1.0 - ratio)
-			} else {
-				lr = baseLR
-			}
-		}
-		prevLoss = loss
-
-		if step%*logEvery == 0 || step == 1 {
-			graph.Sync()
-			elapsed := time.Since(t0)
-			stepsPerSec := float64(step) / elapsed.Seconds()
-			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  floor=%.3f  %.0fs  (%.1f steps/s)\n",
-				step, *stepsFlag, loss, lr, bestFloor, elapsed.Seconds(), stepsPerSec)
-		}
-	}
-
-	graph.Sync()
-	total := time.Since(t0)
-	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)  floor=%.3f\n",
-		*stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds(), bestFloor)
-
-	os.MkdirAll(*saveDir, 0755)
-	fmt.Printf("Model saved to: %s\n", *saveDir)
+	rewriteForSub()
+	cmdTrainAny()
 }
 
-// cmdFinetune is in train_finetune.go
-
+// cmdResume continues training from a checkpoint.
 func cmdResume() {
 	fs := flag.NewFlagSet("resume", flag.ExitOnError)
 	ckptPath := fs.String("checkpoint", "", "Checkpoint directory (or parent to auto-find latest)")
@@ -254,10 +186,8 @@ func cmdResume() {
 	logEvery := fs.Int("log-every", 100, "Log every N steps")
 	fs.Parse(os.Args[2:])
 
-	// Resolve checkpoint
 	ckptDir := *ckptPath
 	if ckptDir == "" {
-		// Try positional arg
 		if fs.NArg() > 0 {
 			ckptDir = fs.Arg(0)
 		}
@@ -267,7 +197,6 @@ func cmdResume() {
 		ckptDir = filepath.Join(home, ".ai", "checkpoints")
 	}
 
-	// If pointed at a parent dir, find latest checkpoint
 	if _, err := os.Stat(filepath.Join(ckptDir, "config.json")); err != nil {
 		latest := findLatestCheckpoint(ckptDir)
 		if latest == "" {
@@ -276,7 +205,6 @@ func cmdResume() {
 		ckptDir = latest
 	}
 
-	// Read config.json from checkpoint
 	configData, err := os.ReadFile(filepath.Join(ckptDir, "config.json"))
 	if err != nil {
 		log.Fatalf("No config.json in checkpoint %s", ckptDir)
@@ -302,7 +230,6 @@ func cmdResume() {
 	seqLen := 64
 	ropeTheta := 10000.0
 
-	// Read meta.json if available
 	startStep := 0
 	lr := float32(6e-4)
 	if meta, err := readCkptMeta(ckptDir); err == nil {
@@ -318,7 +245,6 @@ func cmdResume() {
 		lr = float32(*lrFlag)
 	}
 
-	// Resolve data
 	if *dataPath == "" {
 		if fs.NArg() > 1 {
 			*dataPath = fs.Arg(1)
@@ -355,14 +281,12 @@ func cmdResume() {
 	fmt.Printf("  resume:     step=%d lr=%.1e steps=%d\n", startStep, lr, *stepsFlag)
 	fmt.Println()
 
-	// Build graph
 	ret := graph.BuildFullGraph(dim, kvDim, headDim, heads, kvHeads, ffnDim,
 		vocabSize, nLayers, seqLen, ropeTheta, 1)
 	if ret != 0 {
 		log.Fatalf("BuildFullGraph failed: %d", ret)
 	}
 
-	// Load weights from checkpoint safetensors
 	st, err := gguf.OpenSafeTensors(ckptDir)
 	if err != nil {
 		log.Fatalf("open checkpoint: %v", err)
@@ -371,7 +295,6 @@ func cmdResume() {
 	nW := graph.GraphNumWeights()
 	fmt.Printf("Loading %d weight variables from checkpoint... ", nW)
 
-	// Build weight list in graph variable order: embed, finalNorm, then per-layer
 	var paramNames []string
 	paramNames = append(paramNames, "model.embed_tokens.weight")
 	paramNames = append(paramNames, "model.norm.weight")
@@ -394,23 +317,20 @@ func cmdResume() {
 	}
 
 	for i := 0; i < nW && i < len(paramNames); i++ {
-		data, _, err := st.ReadTensorFloat32(paramNames[i])
+		d, _, err := st.ReadTensorFloat32(paramNames[i])
 		if err != nil {
-			// Some tensors may not exist (biases on models without them)
 			zeros := make([]float32, 1)
 			graph.GraphSetVariable(i, zeros)
 			continue
 		}
-		graph.GraphSetVariable(i, data)
+		graph.GraphSetVariable(i, d)
 	}
 	graph.Sync()
 	fmt.Println("done")
 
-	// Training loop (same as cmdTrain)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	n := seqLen + 1
 	totalSteps := startStep + *stepsFlag
-
 	bestFloor := float32(1e30)
 	baseLR := lr
 
@@ -433,7 +353,6 @@ func cmdResume() {
 			bestFloor = loss
 		}
 
-		// Signal-driven LR dampening
 		if step > startStep+1 && prevLoss > 0 {
 			dLoss := float64(loss) - float64(prevLoss)
 			if dLoss > 0 {
@@ -462,17 +381,14 @@ func cmdResume() {
 	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)  floor=%.3f\n",
 		*stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds(), bestFloor)
 
-	// Save checkpoint
-	saveDir := filepath.Join(ckptDir, "..", fmt.Sprintf("step-%05d", totalSteps))
-	os.MkdirAll(saveDir, 0755)
-	writeCkptMeta(saveDir, &ckptMeta{
+	saveCheckpointDir := filepath.Join(ckptDir, "..", fmt.Sprintf("step-%05d", totalSteps))
+	os.MkdirAll(saveCheckpointDir, 0755)
+	writeCkptMeta(saveCheckpointDir, &ckptMeta{
 		Step: totalSteps,
 		Loss: float64(bestFloor),
 		LR:   float64(lr),
 	})
-
-	// Save config (weight save requires backend-specific GraphReadVariable)
 	configOut, _ := json.MarshalIndent(cfg, "", "  ")
-	os.WriteFile(filepath.Join(saveDir, "config.json"), configOut, 0644)
-	fmt.Printf("Checkpoint saved: %s\n", saveDir)
+	os.WriteFile(filepath.Join(saveCheckpointDir, "config.json"), configOut, 0644)
+	fmt.Printf("Checkpoint saved: %s\n", saveCheckpointDir)
 }

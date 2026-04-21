@@ -298,7 +298,76 @@ func cmdTrainMetal() {
 		nParams += dim + dim*dim + kvDim*dim*2 + dim*dim + dim + ffnDim*dim*2 + dim*ffnDim
 	}
 
-	fmt.Println("ai train-metal — Metal fused kernels + Needle INT8 optimizer")
+	// Mutable constant buffers — CPU writes per step, ICB reads via buffer binding.
+	lrBuf := te.Zeros([]int{1})
+	bc1Buf := te.Zeros([]int{1})
+	bc2Buf := te.Zeros([]int{1})
+	maxNormBuf := te.FromHost([]float32{gradMaxNorm}, []int{1})
+	bb1Buf := te.Zeros([]int{1})
+	gly1Buf := te.Zeros([]int{1})
+	hb1Buf := te.Zeros([]int{1})
+	hb2Buf := te.Zeros([]int{1})
+	gly2Buf := te.Zeros([]int{1})
+	bb2Buf := te.Zeros([]int{1})
+	bondStrBuf := te.Zeros([]int{1})
+
+	// Build ICB
+	icbActs := make([]mongoose.ICBLayerActs, nLayers)
+	icbWeights := make([]mongoose.ICBLayerWeights, nLayers)
+	icbBwds := make([]mongoose.ICBLayerBwd, nLayers)
+	for li := range lays {
+		a := &acts[li]
+		icbActs[li] = mongoose.ICBLayerActs{
+			XIn: a.xIn, Normed: a.normed, Q: a.Q, K: a.K, V: a.V, AttnOut: a.attnOut,
+			XMid: a.xMid, Normed2: a.normed2, GatePre: a.gatePre, UpOut: a.upOut, FfnMid: a.ffnMid,
+			RmsScale1: a.rmsScale1, RmsScale2: a.rmsScale2, GateAct: a.gateAct,
+		}
+		l := &lays[li]
+		lm := &layMasks[li]
+		icbWeights[li] = mongoose.ICBLayerWeights{
+			WQ:   mongoose.ICBLayerInt8{Data: l.wq.data, Scales: l.wq.scales, Delta: l.wq.delta, Mom: l.wq.mom, Vel: l.wq.vel, Live: l.wq.live, Mask: lm.wq},
+			WK:   mongoose.ICBLayerInt8{Data: l.wk.data, Scales: l.wk.scales, Delta: l.wk.delta, Mom: l.wk.mom, Vel: l.wk.vel, Live: l.wk.live, Mask: lm.wk},
+			WV:   mongoose.ICBLayerInt8{Data: l.wv.data, Scales: l.wv.scales, Delta: l.wv.delta, Mom: l.wv.mom, Vel: l.wv.vel, Live: l.wv.live, Mask: lm.wv},
+			WO:   mongoose.ICBLayerInt8{Data: l.wo.data, Scales: l.wo.scales, Delta: l.wo.delta, Mom: l.wo.mom, Vel: l.wo.vel, Live: l.wo.live, Mask: lm.wo},
+			Gate: mongoose.ICBLayerInt8{Data: l.gate.data, Scales: l.gate.scales, Delta: l.gate.delta, Mom: l.gate.mom, Vel: l.gate.vel, Live: l.gate.live, Mask: lm.gate},
+			Up:   mongoose.ICBLayerInt8{Data: l.up.data, Scales: l.up.scales, Delta: l.up.delta, Mom: l.up.mom, Vel: l.up.vel, Live: l.up.live, Mask: lm.up},
+			Down: mongoose.ICBLayerInt8{Data: l.down.data, Scales: l.down.scales, Delta: l.down.delta, Mom: l.down.mom, Vel: l.down.vel, Live: l.down.live, Mask: lm.down},
+			Norm1: l.norm1, Norm2: l.norm2,
+		}
+		b := &bwds[li]
+		icbBwds[li] = mongoose.ICBLayerBwd{
+			DFfnMid: b.dFfnMid, DGate: b.dGate, DUp: b.dUp, DN2: b.dN2, Dx: b.dx,
+			DAttnOut: b.dAttnOut, DQ: b.dQ, DK: b.dK, DV: b.dV, DN1: b.dN1,
+			DWDown: b.dWDown, DWGate: b.dWGate, DWUp: b.dWUp, DWO: b.dWO, DWQ: b.dWQ, DWK: b.dWK, DWV: b.dWV,
+		}
+	}
+	embedInt8 := mongoose.ICBLayerInt8{Data: embedData, Scales: embedScales, Delta: embedDelta, Mom: embedMom, Vel: embedVel, Live: embed, Mask: embedMask}
+
+	mtl.ICBBuildTraining(
+		dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, n, nLayers,
+		hidden, normedFinal, finalNorm, finalScales,
+		lmMaxLogit, lmSumExp, lmLoss, targetsGPU,
+		dHidden, dScratch, dEmbed,
+		gradSumSq, clipScaleBuf, scores,
+		embed, embedInt8,
+		icbActs, icbWeights, icbBwds,
+		lrBuf, bc1Buf, bc2Buf, maxNormBuf,
+		bb1Buf, gly1Buf, hb1Buf, hb2Buf, gly2Buf, bb2Buf, bondStrBuf,
+	)
+
+	// Shared slices for writing per-step constants
+	lrShared := mtl.SharedSlice(lrBuf)
+	bc1Shared := mtl.SharedSlice(bc1Buf)
+	bc2Shared := mtl.SharedSlice(bc2Buf)
+	bb1Shared := mtl.SharedSlice(bb1Buf)
+	gly1Shared := mtl.SharedSlice(gly1Buf)
+	hb1Shared := mtl.SharedSlice(hb1Buf)
+	hb2Shared := mtl.SharedSlice(hb2Buf)
+	gly2Shared := mtl.SharedSlice(gly2Buf)
+	bb2Shared := mtl.SharedSlice(bb2Buf)
+	bondStrShared := mtl.SharedSlice(bondStrBuf)
+
+	fmt.Println("ai train-metal — Metal ICB + Needle INT8 optimizer")
 	fmt.Printf("  engine:   %s\n", eng.Name())
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
 	fmt.Printf("  model:    dim=%d heads=%d kv=%d layers=%d ffn=%d seq=%d vocab=%d\n",
@@ -580,60 +649,25 @@ func cmdTrainMetal() {
 			continue
 		}
 
-		// ============================================================
-		// SINGLE COMMAND BUFFER: forward → GPU loss → backward → clip → needle → dequant
-		// ============================================================
+		// Write per-step constants to shared memory (ICB reads via buffer binding)
+		lrShared[0] = curLR
+		bc1Shared[0] = bc1
+		bc2Shared[0] = bc2
+		bb1Shared[0] = r.Backbone1
+		gly1Shared[0] = r.Glyco1
+		hb1Shared[0] = r.Hbond1
+		hb2Shared[0] = r.Hbond2
+		gly2Shared[0] = r.Glyco2
+		bb2Shared[0] = r.Backbone2
+		bondStrShared[0] = 3.0/5.0 // GC bond for paired, singles use clipScale directly
+
+		// Zero loss scalar (pass2 uses atomic add)
+		lmLossShared[0] = 0
+
+		// === ICB EXECUTE ===
 		ph = time.Now()
-		mtl.FusedBegin()
-
-		// --- FORWARD ---
-		for li := range lays {
-			l := &lays[li]
-			a := &acts[li]
-
-			mtl.FusedCopy(a.xIn, hidden, n*dim)
-			mtl.FusedRMSNorm(hidden, l.norm1, a.rmsScale1, n, dim)
-			mtl.FusedCopy(a.normed, hidden, n*dim)
-			mtl.FusedCopy(hidden, a.xIn, n*dim)
-
-			mtl.FusedGemmF32BT(a.normed, l.wq.live, a.Q, n, dim, dim)
-			mtl.FusedGemmF32BT(a.normed, l.wk.live, a.K, n, dim, kvDim)
-			mtl.FusedGemmF32BT(a.normed, l.wv.live, a.V, n, dim, kvDim)
-
-			mtl.FusedRoPE(a.Q, headDim, heads, 10000.0, dim, n)
-			mtl.FusedRoPE(a.K, headDim, kvHeads, 10000.0, kvDim, n)
-
-			mtl.FusedAttention(a.Q, a.K, a.V, a.attnOut, scores, dim, kvDim, headDim, heads, kvHeads, n)
-
-			mtl.FusedGemmF32BT(a.attnOut, l.wo.live, dScratch, n, dim, dim)
-			mtl.FusedAddInPlace(hidden, dScratch, n*dim)
-
-			mtl.FusedCopy(a.xMid, hidden, n*dim)
-			mtl.FusedRMSNorm(hidden, l.norm2, a.rmsScale2, n, dim)
-			mtl.FusedCopy(a.normed2, hidden, n*dim)
-			mtl.FusedCopy(hidden, a.xMid, n*dim)
-
-			mtl.FusedGemmF32BT(a.normed2, l.gate.live, a.gatePre, n, dim, ffnDim)
-			mtl.FusedGemmF32BT(a.normed2, l.up.live, a.upOut, n, dim, ffnDim)
-
-			mtl.FusedSiLUGateMul(a.gatePre, a.upOut, a.ffnMid, n*ffnDim)
-
-			mtl.FusedGemmF32BT(a.ffnMid, l.down.live, dScratch, n, ffnDim, dim)
-			mtl.FusedAddInPlace(hidden, dScratch, n*dim)
-		}
-
-		mtl.FusedRMSNorm(hidden, finalNorm, finalScales, n, dim)
-		mtl.FusedCopy(normedFinal, hidden, n*dim)
-
-		// --- GPU LOSS: lm_head_pass1 → barrier → lm_head_pass2 → dHidden ---
-		mtl.FusedLMHeadPass1(normedFinal, embed, lmMaxLogit, lmSumExp, dim, vocabSize, n)
-		mtl.FusedBarrierBuffers()
-		mtl.FusedLMHeadPass2(normedFinal, embed, lmMaxLogit, lmSumExp, targetsGPU, dHidden, lmLoss, dim, vocabSize, n)
-		mtl.FusedBarrierBuffers()
-
-		// --- STEP-1 NOOP: forward + loss only, skip backward ---
 		if step == 1 {
-			mtl.FusedEnd()
+			mtl.ICBExecuteFwd()
 			tFwd += time.Since(ph)
 			if step <= 3 || step%*logEvery == 0 {
 				mtl.Sync()
@@ -644,124 +678,7 @@ func cmdTrainMetal() {
 			continue
 		}
 
-		// --- BACKWARD (dHidden already seeded by lm_head_pass2) ---
-		// dEmbed: sparse TN GEMM using the dHidden gradient and normedFinal
-		// Note: lm_head_pass2 produced dHidden = sum_v(grad[v] * embed[v]) per position.
-		// dEmbed needs grad^T @ normedFinal. We approximate with a separate sparse pass.
-		// For now, skip dEmbed gradient (embed updated via conductor hot rows only).
-
-		mtl.FusedRMSNormBwd(dHidden, hidden, finalNorm, finalScales, dScratch, n, dim)
-		mtl.FusedCopy(dHidden, dScratch, n*dim)
-
-		for li := nLayers - 1; li >= 0; li-- {
-			l := &lays[li]
-			a := &acts[li]
-			b := &bwds[li]
-			lm := &layMasks[li]
-
-			mtl.FusedGemmF32NN(dHidden, l.down.live, b.dFfnMid, n, dim, ffnDim)
-			mtl.FusedGemmF32TNSparse(dHidden, a.ffnMid, b.dWDown, lm.down, dim, n, ffnDim)
-
-			mtl.SiLUGateBackward(b.dFfnMid, a.gatePre, a.upOut, a.gateAct, b.dGate, b.dUp)
-
-			mtl.FusedGemmF32NN(b.dGate, l.gate.live, b.dN2, n, ffnDim, dim)
-			mtl.FusedGemmF32NN(b.dUp, l.up.live, b.dx, n, ffnDim, dim)
-			mtl.FusedAddInPlace(b.dN2, b.dx, n*dim)
-
-			mtl.FusedGemmF32TNSparse(b.dGate, a.normed2, b.dWGate, lm.gate, ffnDim, n, dim)
-			mtl.FusedGemmF32TNSparse(b.dUp, a.normed2, b.dWUp, lm.up, ffnDim, n, dim)
-
-			mtl.FusedRMSNormBwd(b.dN2, a.xMid, l.norm2, a.rmsScale2, b.dx, n, dim)
-			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
-
-			mtl.FusedGemmF32NN(dHidden, l.wo.live, b.dAttnOut, n, dim, dim)
-			mtl.FusedGemmF32TNSparse(dHidden, a.attnOut, b.dWO, lm.wo, dim, n, dim)
-
-			mtl.FusedAttentionBwdQ(b.dAttnOut, a.Q, a.K, a.V, scores,
-				b.dQ, b.dK, b.dV, dim, kvDim, headDim, heads, kvHeads, n, n)
-
-			mtl.FusedRoPE(b.dQ, headDim, heads, -10000.0, dim, n)
-			mtl.FusedRoPE(b.dK, headDim, kvHeads, -10000.0, kvDim, n)
-
-			mtl.FusedGemmF32NN(b.dQ, l.wq.live, b.dN1, n, dim, dim)
-			mtl.FusedGemmF32NN(b.dK, l.wk.live, b.dx, n, kvDim, dim)
-			mtl.FusedGemmF32NN(b.dV, l.wv.live, b.dN2, n, kvDim, dim)
-			mtl.FusedAddInPlace(b.dN1, b.dx, n*dim)
-			mtl.FusedAddInPlace(b.dN1, b.dN2, n*dim)
-
-			mtl.FusedGemmF32TNSparse(b.dQ, a.normed, b.dWQ, lm.wq, dim, n, dim)
-			mtl.FusedGemmF32TNSparse(b.dK, a.normed, b.dWK, lm.wk, kvDim, n, dim)
-			mtl.FusedGemmF32TNSparse(b.dV, a.normed, b.dWV, lm.wv, kvDim, n, dim)
-
-			mtl.FusedRMSNormBwd(b.dN1, a.xIn, l.norm1, a.rmsScale1, b.dx, n, dim)
-			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
-		}
-
-		// --- GRAD NORM → CLIP SCALE (GPU) → NEEDLE (with built-in clip + dequant) ---
-		mtl.FusedZeroScalar(gradSumSq)
-		mtl.FusedBarrierBuffers()
-		for li := range lays {
-			b := &bwds[li]
-			mtl.FusedGradNormSq(b.dWQ, gradSumSq, b.dWQ.Size)
-			mtl.FusedGradNormSq(b.dWK, gradSumSq, b.dWK.Size)
-			mtl.FusedGradNormSq(b.dWV, gradSumSq, b.dWV.Size)
-			mtl.FusedGradNormSq(b.dWO, gradSumSq, b.dWO.Size)
-			mtl.FusedGradNormSq(b.dWGate, gradSumSq, b.dWGate.Size)
-			mtl.FusedGradNormSq(b.dWUp, gradSumSq, b.dWUp.Size)
-			mtl.FusedGradNormSq(b.dWDown, gradSumSq, b.dWDown.Size)
-		}
-		mtl.FusedBarrierBuffers()
-		mtl.FusedComputeClipScale(gradSumSq, clipScaleBuf, gradMaxNorm)
-		mtl.FusedBarrierBuffers()
-
-		const beta1 = float32(0.9)
-		const beta2 = float32(0.95)
-		const eps = float32(1e-8)
-		const wd = float32(0.1)
-		bondGC := float32(3.0 / 5.0)
-		bondAT := float32(2.0 / 5.0)
-		needleSingle := func(p int8Param, grad *mongoose.Tensor, mask *mongoose.HotRowMask) {
-			mtl.FusedNeedle(p.data, p.scales, grad,
-				p.mom, p.vel, mask, p.delta,
-				curLR, beta1, beta2, bc1, bc2, eps, wd, p.data.Size, p.cols,
-				p.live, clipScaleBuf)
-		}
-
-		for li := range lays {
-			l := &lays[li]
-			b := &bwds[li]
-			lm := &layMasks[li]
-
-			mtl.FusedNeedlePaired(
-				l.gate.data, l.up.data, l.gate.scales, l.up.scales,
-				b.dWGate, b.dWUp, l.gate.mom, l.up.mom, l.gate.vel, l.up.vel,
-				lm.gate, l.gate.delta, l.up.delta,
-				curLR, beta1, beta2, bc1, bc2, eps, wd,
-				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-				bondGC, l.gate.data.Size, dim, l.gate.live, l.up.live, clipScaleBuf)
-
-			if l.wq.data.Size == l.wk.data.Size {
-				mtl.FusedNeedlePaired(
-					l.wq.data, l.wk.data, l.wq.scales, l.wk.scales,
-					b.dWQ, b.dWK, l.wq.mom, l.wk.mom, l.wq.vel, l.wk.vel,
-					lm.wq, l.wq.delta, l.wk.delta,
-					curLR, beta1, beta2, bc1, bc2, eps, wd,
-					r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-					bondAT, l.wq.data.Size, dim, l.wq.live, l.wk.live, clipScaleBuf)
-			} else {
-				needleSingle(l.wq, b.dWQ, lm.wq)
-				needleSingle(l.wk, b.dWK, lm.wk)
-			}
-
-			needleSingle(l.wv, b.dWV, lm.wv)
-			needleSingle(l.wo, b.dWO, lm.wo)
-			needleSingle(l.down, b.dWDown, lm.down)
-		}
-
-		needleSingle(int8Param{data: embedData, scales: embedScales, delta: embedDelta, mom: embedMom, vel: embedVel, live: embed, rows: vocabSize, cols: dim},
-			dEmbed, embedMask)
-
-		mtl.FusedEnd()
+		mtl.ICBExecuteFull()
 		tFwd += time.Since(ph)
 
 		stepDur := time.Since(stepStart)
