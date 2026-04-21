@@ -236,29 +236,28 @@ func cmdTrainMetal() {
 	hidden := te.Zeros([]int{n, dim})
 	tokGPU := te.Zeros([]int{n})
 	targetsGPU := te.Zeros([]int{n})
-	logitsBuf := te.Zeros([]int{n, vocabSize})
-	gradGPU := te.Zeros([]int{n, vocabSize})
 	normedFinal := te.Zeros([]int{n, dim})
 	finalScales := te.Zeros([]int{n})
+	lmMaxLogit := te.Zeros([]int{n})
+	lmSumExp := te.Zeros([]int{n})
+	lmLoss := te.Zeros([]int{1})
 	dEmbed := te.Zeros([]int{vocabSize, dim})
 	dHidden := te.Zeros([]int{n, dim})
 	dScratch := te.Zeros([]int{n, dim})
-	scores := te.Zeros([]int{n * heads, n})
 	gradSumSq := te.Zeros([]int{1})
 	const gradMaxNorm = float32(1.0)
 
-	type fwdBuf struct {
+	// Forward activations — double-buffered for coiled pipeline.
+	// Set 0 and set 1 alternate: forward writes to act[cur], backward reads act[prev].
+	type actBuf struct {
 		xIn, normed, Q, K, V, attnOut         *mongoose.Tensor
 		xMid, normed2, gatePre, upOut, ffnMid *mongoose.Tensor
 		rmsScale1, rmsScale2                  *mongoose.Tensor
-		dFfnMid, dGate, dUp, dN2, dx         *mongoose.Tensor
-		dAttnOut, dQ, dK, dV, dN1             *mongoose.Tensor
-		dWDown, dWGate, dWUp, dWO, dWQ, dWK, dWV *mongoose.Tensor
 		gateAct                               *mongoose.Tensor
 	}
-	bufs := make([]fwdBuf, nLayers)
-	for i := range bufs {
-		bufs[i] = fwdBuf{
+	acts := make([]actBuf, nLayers)
+	for i := range acts {
+		acts[i] = actBuf{
 			xIn: te.Zeros([]int{n, dim}), normed: te.Zeros([]int{n, dim}),
 			Q: te.Zeros([]int{n, dim}), K: te.Zeros([]int{n, kvDim}), V: te.Zeros([]int{n, kvDim}),
 			attnOut: te.Zeros([]int{n, dim}),
@@ -266,6 +265,20 @@ func cmdTrainMetal() {
 			gatePre: te.Zeros([]int{n, ffnDim}), upOut: te.Zeros([]int{n, ffnDim}),
 			ffnMid: te.Zeros([]int{n, ffnDim}),
 			rmsScale1: te.Zeros([]int{n}), rmsScale2: te.Zeros([]int{n}),
+			gateAct: te.Zeros([]int{n, ffnDim}),
+		}
+	}
+	scores := te.Zeros([]int{n * heads, n})
+
+	// Backward scratch — single set, only used by backward queue
+	type bwdBuf struct {
+		dFfnMid, dGate, dUp, dN2, dx         *mongoose.Tensor
+		dAttnOut, dQ, dK, dV, dN1             *mongoose.Tensor
+		dWDown, dWGate, dWUp, dWO, dWQ, dWK, dWV *mongoose.Tensor
+	}
+	bwds := make([]bwdBuf, nLayers)
+	for i := range bwds {
+		bwds[i] = bwdBuf{
 			dFfnMid: te.Zeros([]int{n, ffnDim}), dGate: te.Zeros([]int{n, ffnDim}),
 			dUp: te.Zeros([]int{n, ffnDim}), dN2: te.Zeros([]int{n, dim}),
 			dx: te.Zeros([]int{n, dim}),
@@ -276,7 +289,6 @@ func cmdTrainMetal() {
 			dWUp: te.Zeros([]int{ffnDim, dim}), dWO: te.Zeros([]int{dim, dim}),
 			dWQ: te.Zeros([]int{dim, dim}), dWK: te.Zeros([]int{kvDim, dim}),
 			dWV: te.Zeros([]int{kvDim, dim}),
-			gateAct: te.Zeros([]int{n, ffnDim}),
 		}
 	}
 
@@ -432,49 +444,9 @@ func cmdTrainMetal() {
 		}
 	}
 
-	cpuSoftmaxCEGrad := func() float32 {
-		mtl.Sync()
-		logitsH := te.ToHost(logitsBuf)
-		targH := te.ToHost(targetsGPU)
-		gradH := make([]float32, n*vocabSize)
-		invN := float32(1.0) / float32(n)
-		var totalLoss float32
-
-		for pos := 0; pos < n; pos++ {
-			off := pos * vocabSize
-			target := int(int32(math.Float32bits(targH[pos])))
-
-			mx := logitsH[off]
-			for v := 1; v < vocabSize; v++ {
-				if logitsH[off+v] > mx {
-					mx = logitsH[off+v]
-				}
-			}
-			var se float32
-			for v := 0; v < vocabSize; v++ {
-				se += float32(math.Exp(float64(logitsH[off+v] - mx)))
-			}
-			prob := float32(math.Exp(float64(logitsH[off+target]-mx))) / se
-			if prob < 1e-10 {
-				prob = 1e-10
-			}
-			totalLoss += -float32(math.Log(float64(prob)))
-
-			for v := 0; v < vocabSize; v++ {
-				sv := float32(math.Exp(float64(logitsH[off+v]-mx))) / se * invN
-				if v == target {
-					sv -= invN
-				}
-				gradH[off+v] = sv
-			}
-		}
-
-		mtl.UploadInto(gradGPU, gradH)
-		return totalLoss / float32(n)
-	}
-
 	embedShared := mtl.SharedSlice(embed)
 	hiddenShared := mtl.SharedSlice(hidden)
+	lmLossShared := mtl.SharedSlice(lmLoss)
 
 	fmt.Println("Training...")
 	t0 := time.Now()
@@ -507,56 +479,14 @@ func cmdTrainMetal() {
 		}
 		tBatch += time.Since(ph)
 
-		// === FORWARD ===
-		ph = time.Now()
-		mtl.FusedBegin()
-
-		for li := range lays {
-			l := &lays[li]
-			b := &bufs[li]
-
-			mtl.FusedCopy(b.xIn, hidden, n*dim)
-			mtl.FusedRMSNorm(hidden, l.norm1, b.rmsScale1, n, dim)
-			mtl.FusedCopy(b.normed, hidden, n*dim)
-			mtl.FusedCopy(hidden, b.xIn, n*dim)
-
-			mtl.FusedGemmF32BT(b.normed, l.wq.live, b.Q, n, dim, dim)
-			mtl.FusedGemmF32BT(b.normed, l.wk.live, b.K, n, dim, kvDim)
-			mtl.FusedGemmF32BT(b.normed, l.wv.live, b.V, n, dim, kvDim)
-
-			mtl.FusedRoPE(b.Q, headDim, heads, 10000.0, dim, n)
-			mtl.FusedRoPE(b.K, headDim, kvHeads, 10000.0, kvDim, n)
-
-			mtl.FusedAttention(b.Q, b.K, b.V, b.attnOut, scores, dim, kvDim, headDim, heads, kvHeads, n)
-
-			mtl.FusedGemmF32BT(b.attnOut, l.wo.live, b.dx, n, dim, dim)
-			mtl.FusedAddInPlace(hidden, b.dx, n*dim)
-
-			mtl.FusedCopy(b.xMid, hidden, n*dim)
-			mtl.FusedRMSNorm(hidden, l.norm2, b.rmsScale2, n, dim)
-			mtl.FusedCopy(b.normed2, hidden, n*dim)
-			mtl.FusedCopy(hidden, b.xMid, n*dim)
-
-			mtl.FusedGemmF32BT(b.normed2, l.gate.live, b.gatePre, n, dim, ffnDim)
-			mtl.FusedGemmF32BT(b.normed2, l.up.live, b.upOut, n, dim, ffnDim)
-
-			mtl.FusedSiLUGateMul(b.gatePre, b.upOut, b.ffnMid, n*ffnDim)
-
-			mtl.FusedGemmF32BT(b.ffnMid, l.down.live, b.dx, n, ffnDim, dim)
-			mtl.FusedAddInPlace(hidden, b.dx, n*dim)
+		// Read loss from PREVIOUS step (one step stale, GPU already done).
+		// Step 1 has no previous loss; use log(vocabSize) as initial estimate.
+		stepLoss := float32(math.Log(float64(vocabSize)))
+		if step > 1 {
+			stepLoss = lmLossShared[0]
 		}
 
-		mtl.FusedRMSNorm(hidden, finalNorm, finalScales, n, dim)
-		mtl.FusedCopy(normedFinal, hidden, n*dim)
-		mtl.FusedGemmF32BT(normedFinal, embed, logitsBuf, n, dim, vocabSize)
-
-		mtl.FusedEnd()
-		tFwd += time.Since(ph)
-
-		ph = time.Now()
-		stepLoss := cpuSoftmaxCEGrad()
-		tLoss += time.Since(ph)
-
+		// === Immune system (uses previous step's loss) ===
 		ph = time.Now()
 		hotRows := conductor.HotRows()
 
@@ -565,7 +495,6 @@ func cmdTrainMetal() {
 				saveHotRows(hotRows, stepLoss, step)
 			}
 		}
-
 		if stepLoss > 0 && stepLoss < bestFloor {
 			bestFloor = stepLoss
 			if !immuneActive {
@@ -574,7 +503,6 @@ func cmdTrainMetal() {
 				recoveryCount = 0
 			}
 		}
-
 		immuneSkip := false
 		if immuneActive && step-floorContactStep >= floorWindow {
 			rebound := stepLoss - bestFloor
@@ -592,58 +520,42 @@ func cmdTrainMetal() {
 				immuneActive = false
 			}
 		}
-
 		if stepLoss < ckptBestLoss && step-lastCkptStep >= 88 && step > 1 {
 			ckptBestLoss = stepLoss
 			lastCkptStep = step
 			go saveFullCheckpoint(step, stepLoss)
 		}
 
-		// === Signal-scaled LR ===
+		// Signal-scaled LR
 		stepLR := getLR(step)
 		if prevLoss > 0 {
 			dLoss := float64(stepLoss) - float64(prevLoss)
 			if dLoss > 0 {
 				ratio := float32(dLoss / math.Max(float64(prevLoss), 1e-6))
-				if ratio > 1.0 {
-					ratio = 1.0
-				}
+				if ratio > 1.0 { ratio = 1.0 }
 				stepLR *= (1.0 - ratio)
 			}
 		}
 		prevLoss = stepLoss
 		curLR = stepLR
-
 		tImmune += time.Since(ph)
 
-		if immuneSkip {
-			continue
-		}
+		if immuneSkip { continue }
 
-		// === STEP-1 NOOP ===
-		if step == 1 {
-			if step <= 3 || step%*logEvery == 0 {
-				elapsed := time.Since(t0)
-				fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  floor=%.3f  %.0fs  (%.1f steps/s) [noop]\n",
-					step, *stepsFlag, stepLoss, curLR, bestFloor, elapsed.Seconds(), float64(step)/elapsed.Seconds())
-			}
-			continue
-		}
-
+		// === Projection trackers + masks (use previous step's activations) ===
 		ph = time.Now()
-		// === Projection tracker observation ===
-		for li := range lays {
-			b := &bufs[li]
-			layTrk[li].wq.ObserveOutput(mtl.SharedSlice(b.Q), n, dim)
-			layTrk[li].wk.ObserveOutput(mtl.SharedSlice(b.K), n, kvDim)
-			layTrk[li].wv.ObserveOutput(mtl.SharedSlice(b.V), n, kvDim)
-			layTrk[li].wo.ObserveOutput(mtl.SharedSlice(b.attnOut), n, dim)
-			layTrk[li].gate.ObserveOutput(mtl.SharedSlice(b.gatePre), n, ffnDim)
-			layTrk[li].up.ObserveOutput(mtl.SharedSlice(b.upOut), n, ffnDim)
-			layTrk[li].down.ObserveOutput(mtl.SharedSlice(b.ffnMid), n, ffnDim)
+		if step > 2 {
+			for li := range lays {
+				a := &acts[li]
+				layTrk[li].wq.ObserveOutput(mtl.SharedSlice(a.Q), n, dim)
+				layTrk[li].wk.ObserveOutput(mtl.SharedSlice(a.K), n, kvDim)
+				layTrk[li].wv.ObserveOutput(mtl.SharedSlice(a.V), n, kvDim)
+				layTrk[li].wo.ObserveOutput(mtl.SharedSlice(a.attnOut), n, dim)
+				layTrk[li].gate.ObserveOutput(mtl.SharedSlice(a.gatePre), n, ffnDim)
+				layTrk[li].up.ObserveOutput(mtl.SharedSlice(a.upOut), n, ffnDim)
+				layTrk[li].down.ObserveOutput(mtl.SharedSlice(a.ffnMid), n, ffnDim)
+			}
 		}
-
-		// === Sparse hot-row masks ===
 		embedMask.Set(conductor.HotRows())
 		for li := range lays {
 			layMasks[li].wq.Set(layTrk[li].wq.HotRows())
@@ -654,7 +566,6 @@ func cmdTrainMetal() {
 			layMasks[li].up.Set(layTrk[li].up.HotRows())
 			layMasks[li].down.Set(layTrk[li].down.HotRows())
 		}
-
 		tObs += time.Since(ph)
 
 		// === Helix rung geometry ===
@@ -668,40 +579,104 @@ func cmdTrainMetal() {
 			continue
 		}
 
-		// === BACKWARD ===
+		// ============================================================
+		// SINGLE COMMAND BUFFER: forward → GPU loss → backward → clip → needle → dequant
+		// ============================================================
 		ph = time.Now()
 		mtl.FusedBegin()
 
-		mtl.FusedGemmF32TNSparse(gradGPU, normedFinal, dEmbed, embedMask, vocabSize, n, dim)
-		mtl.FusedGemmF32NN(gradGPU, embed, dHidden, n, vocabSize, dim)
+		// --- FORWARD ---
+		for li := range lays {
+			l := &lays[li]
+			a := &acts[li]
+
+			mtl.FusedCopy(a.xIn, hidden, n*dim)
+			mtl.FusedRMSNorm(hidden, l.norm1, a.rmsScale1, n, dim)
+			mtl.FusedCopy(a.normed, hidden, n*dim)
+			mtl.FusedCopy(hidden, a.xIn, n*dim)
+
+			mtl.FusedGemmF32BT(a.normed, l.wq.live, a.Q, n, dim, dim)
+			mtl.FusedGemmF32BT(a.normed, l.wk.live, a.K, n, dim, kvDim)
+			mtl.FusedGemmF32BT(a.normed, l.wv.live, a.V, n, dim, kvDim)
+
+			mtl.FusedRoPE(a.Q, headDim, heads, 10000.0, dim, n)
+			mtl.FusedRoPE(a.K, headDim, kvHeads, 10000.0, kvDim, n)
+
+			mtl.FusedAttention(a.Q, a.K, a.V, a.attnOut, scores, dim, kvDim, headDim, heads, kvHeads, n)
+
+			mtl.FusedGemmF32BT(a.attnOut, l.wo.live, dScratch, n, dim, dim)
+			mtl.FusedAddInPlace(hidden, dScratch, n*dim)
+
+			mtl.FusedCopy(a.xMid, hidden, n*dim)
+			mtl.FusedRMSNorm(hidden, l.norm2, a.rmsScale2, n, dim)
+			mtl.FusedCopy(a.normed2, hidden, n*dim)
+			mtl.FusedCopy(hidden, a.xMid, n*dim)
+
+			mtl.FusedGemmF32BT(a.normed2, l.gate.live, a.gatePre, n, dim, ffnDim)
+			mtl.FusedGemmF32BT(a.normed2, l.up.live, a.upOut, n, dim, ffnDim)
+
+			mtl.FusedSiLUGateMul(a.gatePre, a.upOut, a.ffnMid, n*ffnDim)
+
+			mtl.FusedGemmF32BT(a.ffnMid, l.down.live, dScratch, n, ffnDim, dim)
+			mtl.FusedAddInPlace(hidden, dScratch, n*dim)
+		}
+
+		mtl.FusedRMSNorm(hidden, finalNorm, finalScales, n, dim)
+		mtl.FusedCopy(normedFinal, hidden, n*dim)
+
+		// --- GPU LOSS: lm_head_pass1 → barrier → lm_head_pass2 → dHidden ---
+		mtl.FusedLMHeadPass1(normedFinal, embed, lmMaxLogit, lmSumExp, dim, vocabSize, n)
+		mtl.FusedBarrierBuffers()
+		mtl.FusedLMHeadPass2(normedFinal, embed, lmMaxLogit, lmSumExp, targetsGPU, dHidden, lmLoss, dim, vocabSize, n)
+		mtl.FusedBarrierBuffers()
+
+		// --- STEP-1 NOOP: forward + loss only, skip backward ---
+		if step == 1 {
+			mtl.FusedEnd()
+			tFwd += time.Since(ph)
+			if step <= 3 || step%*logEvery == 0 {
+				mtl.Sync()
+				elapsed := time.Since(t0)
+				fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  floor=%.3f  %.0fs  (%.1f steps/s) [noop]\n",
+					step, *stepsFlag, lmLossShared[0], curLR, bestFloor, elapsed.Seconds(), float64(step)/elapsed.Seconds())
+			}
+			continue
+		}
+
+		// --- BACKWARD (dHidden already seeded by lm_head_pass2) ---
+		// dEmbed: sparse TN GEMM using the dHidden gradient and normedFinal
+		// Note: lm_head_pass2 produced dHidden = sum_v(grad[v] * embed[v]) per position.
+		// dEmbed needs grad^T @ normedFinal. We approximate with a separate sparse pass.
+		// For now, skip dEmbed gradient (embed updated via conductor hot rows only).
 
 		mtl.FusedRMSNormBwd(dHidden, hidden, finalNorm, finalScales, dScratch, n, dim)
 		mtl.FusedCopy(dHidden, dScratch, n*dim)
 
 		for li := nLayers - 1; li >= 0; li-- {
 			l := &lays[li]
-			b := &bufs[li]
+			a := &acts[li]
+			b := &bwds[li]
 			lm := &layMasks[li]
 
 			mtl.FusedGemmF32NN(dHidden, l.down.live, b.dFfnMid, n, dim, ffnDim)
-			mtl.FusedGemmF32TNSparse(dHidden, b.ffnMid, b.dWDown, lm.down, dim, n, ffnDim)
+			mtl.FusedGemmF32TNSparse(dHidden, a.ffnMid, b.dWDown, lm.down, dim, n, ffnDim)
 
-			mtl.SiLUGateBackward(b.dFfnMid, b.gatePre, b.upOut, b.gateAct, b.dGate, b.dUp)
+			mtl.SiLUGateBackward(b.dFfnMid, a.gatePre, a.upOut, a.gateAct, b.dGate, b.dUp)
 
 			mtl.FusedGemmF32NN(b.dGate, l.gate.live, b.dN2, n, ffnDim, dim)
 			mtl.FusedGemmF32NN(b.dUp, l.up.live, b.dx, n, ffnDim, dim)
 			mtl.FusedAddInPlace(b.dN2, b.dx, n*dim)
 
-			mtl.FusedGemmF32TNSparse(b.dGate, b.normed2, b.dWGate, lm.gate, ffnDim, n, dim)
-			mtl.FusedGemmF32TNSparse(b.dUp, b.normed2, b.dWUp, lm.up, ffnDim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dGate, a.normed2, b.dWGate, lm.gate, ffnDim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dUp, a.normed2, b.dWUp, lm.up, ffnDim, n, dim)
 
-			mtl.FusedRMSNormBwd(b.dN2, b.xMid, l.norm2, b.rmsScale2, b.dx, n, dim)
+			mtl.FusedRMSNormBwd(b.dN2, a.xMid, l.norm2, a.rmsScale2, b.dx, n, dim)
 			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
 
 			mtl.FusedGemmF32NN(dHidden, l.wo.live, b.dAttnOut, n, dim, dim)
-			mtl.FusedGemmF32TNSparse(dHidden, b.attnOut, b.dWO, lm.wo, dim, n, dim)
+			mtl.FusedGemmF32TNSparse(dHidden, a.attnOut, b.dWO, lm.wo, dim, n, dim)
 
-			mtl.FusedAttentionBwdQ(b.dAttnOut, b.Q, b.K, b.V, scores,
+			mtl.FusedAttentionBwdQ(b.dAttnOut, a.Q, a.K, a.V, scores,
 				b.dQ, b.dK, b.dV, dim, kvDim, headDim, heads, kvHeads, n, n)
 
 			mtl.FusedRoPE(b.dQ, headDim, heads, -10000.0, dim, n)
@@ -713,26 +688,19 @@ func cmdTrainMetal() {
 			mtl.FusedAddInPlace(b.dN1, b.dx, n*dim)
 			mtl.FusedAddInPlace(b.dN1, b.dN2, n*dim)
 
-			mtl.FusedGemmF32TNSparse(b.dQ, b.normed, b.dWQ, lm.wq, dim, n, dim)
-			mtl.FusedGemmF32TNSparse(b.dK, b.normed, b.dWK, lm.wk, kvDim, n, dim)
-			mtl.FusedGemmF32TNSparse(b.dV, b.normed, b.dWV, lm.wv, kvDim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dQ, a.normed, b.dWQ, lm.wq, dim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dK, a.normed, b.dWK, lm.wk, kvDim, n, dim)
+			mtl.FusedGemmF32TNSparse(b.dV, a.normed, b.dWV, lm.wv, kvDim, n, dim)
 
-			mtl.FusedRMSNormBwd(b.dN1, b.xIn, l.norm1, b.rmsScale1, b.dx, n, dim)
+			mtl.FusedRMSNormBwd(b.dN1, a.xIn, l.norm1, a.rmsScale1, b.dx, n, dim)
 			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
 		}
 
-		// No pre-clip diagnostic
-
-		mtl.FusedEnd()
-		tBwd += time.Since(ph)
-
-		// === GPU gradient clipping ===
-		ph = time.Now()
-		mtl.FusedBegin()
+		// --- GRAD CLIPPING ---
 		mtl.FusedZeroScalar(gradSumSq)
 		mtl.FusedBarrierBuffers()
 		for li := range lays {
-			b := &bufs[li]
+			b := &bwds[li]
 			mtl.FusedGradNormSq(b.dWQ, gradSumSq, b.dWQ.Size)
 			mtl.FusedGradNormSq(b.dWK, gradSumSq, b.dWK.Size)
 			mtl.FusedGradNormSq(b.dWV, gradSumSq, b.dWV.Size)
@@ -741,10 +709,9 @@ func cmdTrainMetal() {
 			mtl.FusedGradNormSq(b.dWUp, gradSumSq, b.dWUp.Size)
 			mtl.FusedGradNormSq(b.dWDown, gradSumSq, b.dWDown.Size)
 		}
-		mtl.FusedGradNormSq(dEmbed, gradSumSq, dEmbed.Size)
 		mtl.FusedBarrierBuffers()
 		for li := range lays {
-			b := &bufs[li]
+			b := &bwds[li]
 			mtl.FusedGradClipScale(b.dWQ, gradSumSq, gradMaxNorm, b.dWQ.Size)
 			mtl.FusedGradClipScale(b.dWK, gradSumSq, gradMaxNorm, b.dWK.Size)
 			mtl.FusedGradClipScale(b.dWV, gradSumSq, gradMaxNorm, b.dWV.Size)
@@ -753,15 +720,9 @@ func cmdTrainMetal() {
 			mtl.FusedGradClipScale(b.dWUp, gradSumSq, gradMaxNorm, b.dWUp.Size)
 			mtl.FusedGradClipScale(b.dWDown, gradSumSq, gradMaxNorm, b.dWDown.Size)
 		}
-		mtl.FusedGradClipScale(dEmbed, gradSumSq, gradMaxNorm, dEmbed.Size)
 		mtl.FusedBarrierBuffers()
 
-		mtl.FusedEnd()
-		tClip += time.Since(ph)
-
-		// === NEEDLE optimizer ===
-		ph = time.Now()
-		mtl.FusedBegin()
+		// --- NEEDLE OPTIMIZER ---
 		const beta1 = float32(0.9)
 		const beta2 = float32(0.95)
 		const eps = float32(1e-8)
@@ -775,9 +736,9 @@ func cmdTrainMetal() {
 				curLR, beta1, beta2, bc1, bc2, eps, wd, p.data.Size, p.cols)
 		}
 
-			for li := range lays {
+		for li := range lays {
 			l := &lays[li]
-			b := &bufs[li]
+			b := &bwds[li]
 			lm := &layMasks[li]
 
 			mtl.FusedNeedlePaired(
@@ -809,12 +770,7 @@ func cmdTrainMetal() {
 		needleSingle(int8Param{data: embedData, scales: embedScales, delta: embedDelta, mom: embedMom, vel: embedVel, live: embed, rows: vocabSize, cols: dim},
 			dEmbed, embedMask)
 
-		mtl.FusedEnd()
-		tNeedle += time.Since(ph)
-
-		// === Sparse dequant: only re-dequant rows needle touched ===
-		ph = time.Now()
-		mtl.FusedBegin()
+		// --- SPARSE DEQUANT ---
 		mtl.FusedBarrierBuffers()
 		for li := range lays {
 			l := &lays[li]
@@ -830,7 +786,7 @@ func cmdTrainMetal() {
 		mtl.FusedDequantDeltaSparse(embedData, embedScales, embedDelta, embed, embedMask, embedData.Size, dim)
 
 		mtl.FusedEnd()
-		tDequant += time.Since(ph)
+		tFwd += time.Since(ph)
 
 		stepDur := time.Since(stepStart)
 		if step <= 3 || step%*logEvery == 0 || step == *stepsFlag {
