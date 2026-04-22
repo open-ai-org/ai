@@ -664,6 +664,9 @@ func cmdTrainCUDA() {
 		}
 		mc.SyncAll()
 		mongoose.SetDevice(0)
+		// Helix Dispatch needs h16Scratch and normedFinal16 on GPU 0 for loss computation
+		h16Scratch = cuda.AllocFP16Tensor(n*dim, []int{n*dim})
+		normedFinal16 = cuda.AllocFP16Tensor(n*dim, []int{n*dim})
 		log.Printf("[helix-dispatch] %d GPUs, m=%d positions each, %d layers", nGPUs, m, nLayers)
 	}
 
@@ -924,33 +927,16 @@ func cmdTrainCUDA() {
 			// Both GPUs run ALL layers simultaneously on their share of positions.
 			// Zero pipeline stalls. Only K,V exchange for attention per layer.
 
-			// Convert hidden(FP32) → FP16 on GPU 0
-			mongoose.KFP32ToFP16(hidden.DevicePtr(), hdHidden16[0], n*dim)
+			// Convert hidden(FP32) → FP16 into a full-size temp buffer on GPU 0
+			fullH16 := cuda.AllocFP16Tensor(n*dim, []int{n*dim})
+			mongoose.KFP32ToFP16(hidden.DevicePtr(), fullH16.DevicePtr(), n*dim)
 
 			// Scatter: extract interleaved rows to each GPU
-			// GPU 0 gets even positions (0,2,4,...), GPU 1 gets odd (1,3,5,...)
-			// GPU 0's rows are extracted in-place from the full hidden
-			tmpScatter := h16Scratch.DevicePtr()
-			mongoose.InterleaveExtract(hdHidden16[0], tmpScatter, n, dim, nGPUs, 0, 2)
-			mongoose.KCopy(hdHidden16[0], tmpScatter, m*dim*2)
+			mongoose.InterleaveExtract(fullH16.DevicePtr(), hdHidden16[0], n, dim, nGPUs, 0, 2)
 			for d := 1; d < nGPUs; d++ {
-				mongoose.InterleaveExtract(unsafe.Pointer(uintptr(0)), tmpScatter, n, dim, nGPUs, d, 2)
-			}
-			// Wait — InterleaveExtract needs the ORIGINAL full hidden, but I already overwrote hdHidden16[0].
-			// Need to extract all GPUs' rows before overwriting. Let me fix this.
-
-			// Actually: extract odd rows first (before overwriting), P2P to GPU 1, then extract even.
-			// Or: use h16Scratch as the full hidden, extract from there.
-			_ = tmpScatter
-
-			// Simpler: h16Scratch has the full FP16 hidden. Extract from it.
-			// GPU 0 even rows:
-			mongoose.InterleaveExtract(h16Scratch.DevicePtr(), hdHidden16[0], n, dim, nGPUs, 0, 2)
-			// GPU 1+ odd rows: extract to a temp buffer on GPU 0, P2P to target
-			for d := 1; d < nGPUs; d++ {
-				scratch0 := cuda.AllocFP16Tensor(m*dim, []int{m*dim})
-				mongoose.InterleaveExtract(h16Scratch.DevicePtr(), scratch0.DevicePtr(), n, dim, nGPUs, d, 2)
-				mc.PeerCopyInto(0, scratch0.DevicePtr(), d, hdHidden16[d], m*dim*2)
+				scatterBuf := cuda.AllocFP16Tensor(m*dim, []int{m*dim})
+				mongoose.InterleaveExtract(fullH16.DevicePtr(), scatterBuf.DevicePtr(), n, dim, nGPUs, d, 2)
+				mc.PeerCopyInto(0, scatterBuf.DevicePtr(), d, hdHidden16[d], m*dim*2)
 			}
 			mc.SyncAll()
 
@@ -1061,16 +1047,16 @@ func cmdTrainCUDA() {
 
 			// Gather: interleave results back to GPU 0 for loss computation
 			mongoose.SetDevice(0)
-			fullH16 := h16Scratch.DevicePtr()
-			mongoose.InterleaveInsert(hdHidden16[0], fullH16, n, dim, nGPUs, 0, 2)
+			gatherBuf := h16Scratch.DevicePtr()
+			mongoose.InterleaveInsert(hdHidden16[0], gatherBuf, n, dim, nGPUs, 0, 2)
 			for d := 1; d < nGPUs; d++ {
 				scratch0 := cuda.AllocFP16Tensor(m*dim, []int{m*dim})
 				mc.PeerCopyInto(d, hdHidden16[d], 0, scratch0.DevicePtr(), m*dim*2)
-				mongoose.InterleaveInsert(scratch0.DevicePtr(), fullH16, n, dim, nGPUs, d, 2)
+				mongoose.InterleaveInsert(scratch0.DevicePtr(), gatherBuf, n, dim, nGPUs, d, 2)
 			}
 
 			// FP16→FP32 for loss
-			mongoose.KFP16ToFP32(fullH16, hidden.DevicePtr(), n*dim)
+			mongoose.KFP16ToFP32(gatherBuf, hidden.DevicePtr(), n*dim)
 
 			// Final RMSNorm + logits + loss (on GPU 0, full seqLen)
 			mongoose.KFP32ToFP16(hidden.DevicePtr(), h16Scratch.DevicePtr(), n*dim)
