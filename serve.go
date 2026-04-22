@@ -1166,7 +1166,7 @@ func (s *serveState) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"model_loaded": modelLoaded,
 		"model":        modelName,
 		"gpu":          hasGPU,
-		"version":      "ai v1.1.1",
+		"version":      "ai v1.2.1",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
