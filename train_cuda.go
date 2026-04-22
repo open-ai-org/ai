@@ -367,14 +367,13 @@ func cmdTrainCUDA() {
 		return as{mc.ZerosFP32OnDevice(dev, sz), mc.ZerosFP32OnDevice(dev, sz)}
 	}
 	embedAS := newAS(0, vocabSize * dim)
-	type layerAS struct{ wq, wk, wv, wo, gate, up, down as }
+	type layerAS struct{ wq, wk, wv, wo, gate, up as }
 	layAS := make([]layerAS, nLayers)
 	for l := range layAS {
 		dev := layerDev[l]
 		layAS[l] = layerAS{
 			wq: newAS(dev, dim * dim), wk: newAS(dev, kvDim * dim), wv: newAS(dev, kvDim * dim),
 			wo: newAS(dev, dim * dim), gate: newAS(dev, ffnDim * dim), up: newAS(dev, ffnDim * dim),
-			down: newAS(dev, dim * ffnDim),
 		}
 	}
 
@@ -1215,21 +1214,19 @@ func cmdTrainCUDA() {
 			// gate↔up: GC pair (3 H-bonds)
 			helixPair(l.gate, l.up, b.dWGate, b.dWUp, la.gate.m, la.up.m, la.gate.v, la.up.v, 3.0/5.0, l.gate.Size)
 
-			// wq↔wk: AT pair (2 H-bonds) when same size, AdamW singles when GQA
-			if l.wq.Size == l.wk.Size {
-				helixPair(l.wq, l.wk, b.dWQ, b.dWK, la.wq.m, la.wk.m, la.wq.v, la.wk.v, 2.0/5.0, l.wq.Size)
-			} else {
-				mongoose.KAdamW(l.wq.DevicePtr(), b.dWQ.DevicePtr(), la.wq.m.DevicePtr(), la.wq.v.DevicePtr(), curLR, 0.1, step, l.wq.Size)
-				mongoose.KAdamW(l.wk.DevicePtr(), b.dWK.DevicePtr(), la.wk.m.DevicePtr(), la.wk.v.DevicePtr(), curLR, 0.1, step, l.wk.Size)
-			}
+			// wq↔wo: AT pair (2 H-bonds) — query↔output projection
+			helixPair(l.wq, l.wo, b.dWQ, b.dWO, la.wq.m, la.wo.m, la.wq.v, la.wo.v, 2.0/5.0, l.wq.Size)
 
-			// Singles: AdamW with rung-modulated curLR (curLR already has Helix signal scaling)
-			mongoose.KAdamW(l.wv.DevicePtr(), b.dWV.DevicePtr(), la.wv.m.DevicePtr(), la.wv.v.DevicePtr(), curLR, 0.1, step, l.wv.Size)
-			mongoose.KAdamW(l.wo.DevicePtr(), b.dWO.DevicePtr(), la.wo.m.DevicePtr(), la.wo.v.DevicePtr(), curLR, 0.1, step, l.wo.Size)
-			mongoose.KAdamW(l.down.DevicePtr(), b.dWDown.DevicePtr(), la.down.m.DevicePtr(), la.down.v.DevicePtr(), curLR, 0.1, step, l.down.Size)
+			// wk↔wv: AT pair (2 H-bonds) — key↔value projection
+			helixPair(l.wk, l.wv, b.dWK, b.dWV, la.wk.m, la.wv.m, la.wk.v, la.wv.v, 2.0/5.0, l.wk.Size)
+
+			// down: rung-modulated SGD — FFN gradient signal captured by gate↔up pair
+			mongoose.KGradScale(b.dWDown.DevicePtr(), -curLR, l.down.Size)
+			mongoose.KAddInPlace(l.down.DevicePtr(), b.dWDown.DevicePtr(), l.down.Size)
 		}
 		if multiGPU { mongoose.SetDevice(0) }
 
+		// embed: rung-modulated AdamW
 		mongoose.KAdamW(embed.DevicePtr(), dEmbed.DevicePtr(), embedAS.m.DevicePtr(), embedAS.v.DevicePtr(), curLR, 0.1, step, embed.Size)
 
 		// Sync FP32 master weights → FP16 for next forward
