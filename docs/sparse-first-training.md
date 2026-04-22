@@ -7,7 +7,7 @@ April 2026
 
 ## Abstract
 
-We present sparse-first training, a framework that designs every stage of the training pipeline around observed sparsity rather than treating sparsity as a post-hoc compression technique. Our system observes which parameters are active during forward computation, computes gradients only for active rows, updates weights only where momentum is non-negligible, and stores optimizer state only for live parameters. On a byte-level transformer (128–4096 dimensions, 4 layers), sparse-first training achieves 1.3–2.2x the throughput of PyTorch MPS on Apple M4 Max while converging to lower loss at large model sizes. On NVIDIA RTX 5090, the system reaches 700 steps/s on a 623K-parameter model. The key insight is that sparsity compounds: 80% sparse gradients fed into a sparse optimizer that writes sparse weight updates produces end-to-end compute savings far exceeding any single sparse technique in isolation.
+We present sparse-first training, a framework that designs every stage of the training pipeline around observed sparsity rather than treating sparsity as a post-hoc compression technique. Our system observes which parameters are active during forward computation, computes gradients only for active rows, updates weights only where momentum is non-negligible, and stores optimizer state only for live parameters. On dual H100 SXM with NVLink, sparse-first training achieves 1.54x the throughput of PyTorch DDP at dim=4096 (1.2B parameters) using Helix Dispatch — interleaved position parallelism with zero gradient synchronization. On a single RTX 5090, the system reaches 773 steps/s at dim=128 and 74 steps/s at dim=2048. The key insight is that sparsity compounds: 80% sparse gradients fed into a sparse optimizer that writes sparse weight updates produces end-to-end compute savings far exceeding any single sparse technique in isolation.
 
 ## Why This Matters: The Cost of Dense Training
 
@@ -27,7 +27,7 @@ At 80% sparsity (typical for projection weights), optimizer memory drops from 8 
 
 The wall-time savings follow from compute savings. Sparse backward skips 80% of weight gradient tiles. The sparse optimizer processes 80% fewer elements. On our benchmarks, this translates to 1.3–2.2x throughput improvement at dims 128–4096, with the advantage growing at production vocabulary sizes (50K+) where gradient sparsity exceeds 99%.
 
-**The energy implication is direct**: 1.7x faster training at dim=4096 means 41% less GPU-hours, 41% less electricity, 41% less cooling. For a hyperscaler running thousands of training jobs, sparse-first training is not a performance optimization — it is an energy policy.
+**The energy implication is direct**: 1.54x faster training at dim=4096 on dual H100 means 35% less GPU-hours, 35% less electricity, 35% less cooling. For a hyperscaler running thousands of training jobs, sparse-first training is not a performance optimization — it is an energy policy.
 
 ## 1. Introduction
 
@@ -73,7 +73,7 @@ Needle replaces this with sparse INT8 training. The model weights are stored as 
 
 The weight is FP32 for nanoseconds — only in register, never in global memory. Frozen rows (mask = 0) early-return from the kernel. Memory scales with the active parameter count, not the total parameter count.
 
-For paired parameters (gate↔up with G≡C hydrogen bonding, Q↔K with A≡T bonding), the paired Needle kernel couples gradients through the DNA rung geometry: each strand's effective gradient includes a cross-coupling term scaled by hydrogen bond strength (3/5 for G≡C, 2/5 for A≡T). This couples the learning dynamics of parameter pairs that are functionally related.
+For paired parameters (gate↔up with G≡C hydrogen bonding, Q↔O and K↔V with A≡T bonding), the paired kernel couples gradients through the DNA rung geometry: each strand's effective gradient includes a cross-coupling term scaled by hydrogen bond strength (3/5 for G≡C, 2/5 for A≡T). Three pairs per layer, zero orphan weights. This couples the learning dynamics of parameter pairs that are functionally related.
 
 ### 2.4 Sparse Dequantization
 
@@ -185,7 +185,7 @@ Byte-level transformer, 4 layers, seq_len=64, vocab=256, 100 training steps.
 | 200 | 2.184 | 1.892 | |
 | 300 | 2.047 | 1.755 | |
 | 400 | 1.940 | 1.285 | immune rewind at step 356 |
-| 500 | 1.951 | 1.285 | 364.8 steps/s steady state |
+| 500 | 1.951 | 1.285 |  |
 
 Loss drops 4.8x in 500 steps. The immune system is visible in the floor column — it tracks the best-seen loss and reverts when loss rebounds past a threshold. The rewind at step 356 snapped hot-row weights back to the step-336 checkpoint, producing a discontinuity in the floor that accelerated subsequent convergence.
 
