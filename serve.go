@@ -711,11 +711,15 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 	cfg := s.cfg
 	s.mu.RUnlock()
 
-	var chatMsgs []chatMessage
+	// Build prompt: use last user message as raw text for now
+	// ChatML template produces garbage on small models via Metal graph path
+	var prompt string
 	for _, m := range req.Messages {
-		chatMsgs = append(chatMsgs, chatMessage{Role: m.Role, Content: m.Content})
+		if m.Role == "user" {
+			prompt = m.Content
+		}
 	}
-	promptTokens := applyChatTemplate(tok, chatMsgs, cfg)
+	promptTokens := tok.Encode(prompt)
 
 	if req.Stream {
 		s.handleChatStream(w, req, promptTokens, maxTokens)
