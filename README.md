@@ -174,6 +174,53 @@ step 500   loss 1.95   floor 1.29   365 steps/s
 | Vulkan | Any GPU (AMD, Intel, NVIDIA) | `CGO_ENABLED=0 go install` (WebGPU) |
 | CPU | Any | `CGO_ENABLED=0 go install` |
 
+### Compute Kernels
+
+Custom fused kernels unlock the fastest paths for training and inference. Without them, `ai` falls back to generic GPU matmul which still works but is slower.
+
+**Metal (macOS)** — pre-compiled `.metallib` files ship in the mongoose repo. `brew install` places them automatically. For `go install`, copy them next to the binary:
+
+```bash
+# Metal 4 GEMM (optimal path — requires macOS >= 26.3)
+cp mongoose/kernels/gemm_metal4.metallib $(go env GOPATH)/bin/
+
+# Fused training kernels (RMSNorm, RoPE, attention, SiLU, AdamW)
+cp mongoose/kernels/fused_train.metallib $(go env GOPATH)/bin/
+```
+
+Or compile from source:
+
+```bash
+cd mongoose/kernels
+xcrun metal -std=metal4.0 -O2 -c gemm_metal4.metal -o gemm_metal4.air
+xcrun metallib -o gemm_metal4.metallib gemm_metal4.air
+cp gemm_metal4.metallib $(go env GOPATH)/bin/
+```
+
+Metal 4 `matmul2d` TensorOp requires macOS 26.3+ and Apple Silicon. On older macOS, `ai` falls back to MPS tiled GEMM automatically.
+
+**CUDA (Linux)** — compile from source (architecture-specific):
+
+```bash
+cd mongoose/kernels
+nvcc -shared -o libmongoose_kernels.so mongoose.cu \
+  -Xcompiler -fPIC -gencode arch=compute_90,code=compute_90
+cp libmongoose_kernels.so $(go env GOPATH)/bin/
+```
+
+Replace `compute_90` with your GPU's compute capability (e.g., `compute_89` for RTX 4090, `compute_120` for RTX 5090).
+
+| Kernel | What it fuses |
+|--------|--------------|
+| RMSNorm | in-place + out-of-place, forward + backward |
+| RoPE | rotate_half, forward + backward |
+| GQA Attention | grouped query attention decode |
+| SiLU Gate Mul | SiLU activation * gate, forward + backward |
+| Q8/Q4 Matvec | fused dequant + matrix-vector multiply |
+| AdamW | fused optimizer step |
+| Embedding | gather + scatter |
+| Cross-Entropy | softmax + CE loss + gradient in one pass |
+
 ## Dependencies
 
 - [mongoose](https://github.com/open-ai-org/mongoose) — GPU compute engine
