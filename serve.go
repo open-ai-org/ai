@@ -12,6 +12,7 @@
 //
 // Usage:
 //   ai serve [--host 0.0.0.0] [--port 11434] [--model <name>]
+//   ai serve Qwen2.5-0.5B --daemon     Run in background, write PID to ~/.ai/serve.pid
 
 package main
 
@@ -23,13 +24,16 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/open-ai-org/mongoose"
 	"github.com/open-ai-org/gguf"
+	"github.com/open-ai-org/mongoose"
 	"github.com/open-ai-org/tokenizer"
 )
 
@@ -247,6 +251,8 @@ func cmdServe(args map[string]string) {
 		port = v
 	}
 
+	daemon := false
+
 	// Also support --flag syntax for backwards compat
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -265,7 +271,26 @@ func cmdServe(args map[string]string) {
 				modelName = os.Args[i+1]
 				i++
 			}
+		case "--daemon", "-d":
+			daemon = true
+		case "--stop":
+			stopExistingDaemon()
+			fmt.Println("ai serve stopped")
+			return
 		}
+	}
+	if v, ok := args["daemon"]; ok && v == "true" {
+		daemon = true
+	}
+	if _, ok := args["stop"]; ok {
+		stopExistingDaemon()
+		fmt.Println("ai serve stopped")
+		return
+	}
+
+	if daemon {
+		daemonize(host, port, modelName)
+		return
 	}
 
 	state := &serveState{}
@@ -426,14 +451,125 @@ func (s *serveState) loadModel(name string) error {
 		}
 	}
 
-	// CPU fallback if no GPU path
+	// Generic fallback: any engine with MatMul
 	if s.fwd == nil {
-		log.Printf("[serve] using CPU inference fallback")
+		log.Printf("[serve] using generic inference (weights streamed, CPU attention)")
+		normEps := float32(1e-6)
+		if v, ok := cfg["rms_norm_eps"].(float64); ok {
+			normEps = float32(v)
+		}
+		dim := s.dim
+		nLayers := s.layers
+		heads := s.heads
+		kvHeads := s.kvHeads
+		headDim := dim / heads
+		kvDim := kvHeads * headDim
+		ffnDim := s.ffnDim
+		vocabSize := s.vocabSize
+		maxSeq := s.maxSeq
+		halfHead := s.halfHead
+
+		keyCache := make([][]float32, nLayers)
+		valCache := make([][]float32, nLayers)
+		for l := 0; l < nLayers; l++ {
+			keyCache[l] = make([]float32, maxSeq*kvDim)
+			valCache[l] = make([]float32, maxSeq*kvDim)
+		}
+		att := make([]float32, heads*maxSeq)
+		x := make([]float32, dim)
+		buf := make([]float32, dim)
+		q := make([]float32, dim)
+		k := make([]float32, kvDim)
+		v := make([]float32, kvDim)
+		attnOut := make([]float32, dim)
+		ffnBuf := make([]float32, ffnDim)
+		ffnBuf2 := make([]float32, ffnDim)
+
+		rmsNorm := func(data, weight []float32, eps float32) {
+			n := len(data)
+			var ss float32
+			for i := 0; i < n; i++ { ss += data[i] * data[i] }
+			ss = 1.0 / float32(math.Sqrt(float64(ss/float32(n)+eps)))
+			for i := 0; i < n; i++ { data[i] = data[i] * ss * weight[i] }
+		}
+		mv := func(out, W, xIn []float32, rows, cols int) {
+			copy(out, s.eng.MatMul(W, xIn, rows, cols, 1))
+		}
+
+		_ = halfHead
+
 		s.fwd = func(tokenID, pos int) []float32 {
-			tokOff := tokenID * s.dim
-			if tokOff+s.dim > len(s.embedData) { return nil }
-			// Stub — returns nil to signal unimplemented
-			return nil
+			tokOff := tokenID * dim
+			if tokOff+dim > len(s.embedData) { return nil }
+			copy(x, s.embedData[tokOff:tokOff+dim])
+
+			for l := 0; l < nLayers; l++ {
+				prefix := fmt.Sprintf("model.layers.%d.", l)
+				normW, _, _ := st.ReadTensorFloat32(prefix + "input_layernorm.weight")
+				copy(buf, x)
+				rmsNorm(buf, normW, normEps)
+
+				wq, _, _ := st.ReadTensorFloat32(prefix + "self_attn.q_proj.weight")
+				wk, _, _ := st.ReadTensorFloat32(prefix + "self_attn.k_proj.weight")
+				wv, _, _ := st.ReadTensorFloat32(prefix + "self_attn.v_proj.weight")
+				mv(q, wq, buf, dim, dim)
+				mv(k[:kvDim], wk, buf, kvDim, dim)
+				mv(v[:kvDim], wv, buf, kvDim, dim)
+
+				applyRoPE(q, k[:kvDim], pos, headDim, 10000.0, heads, kvHeads)
+
+				copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], k[:kvDim])
+				copy(valCache[l][pos*kvDim:(pos+1)*kvDim], v[:kvDim])
+
+				kvMul := heads / kvHeads
+				for i := range attnOut { attnOut[i] = 0 }
+				for h := 0; h < heads; h++ {
+					qOff := h * headDim
+					kvOff := (h / kvMul) * headDim
+					scale := float32(1.0 / math.Sqrt(float64(headDim)))
+					for t := 0; t <= pos; t++ {
+						var dot float64
+						for j := 0; j < headDim; j++ {
+							dot += float64(q[qOff+j]) * float64(keyCache[l][t*kvDim+kvOff+j])
+						}
+						att[h*(pos+1)+t] = float32(dot) * scale
+					}
+					softmax(att[h*(pos+1):h*(pos+1)+(pos+1)], pos+1)
+					for t := 0; t <= pos; t++ {
+						w := att[h*(pos+1)+t]
+						for j := 0; j < headDim; j++ {
+							attnOut[qOff+j] += w * valCache[l][t*kvDim+kvOff+j]
+						}
+					}
+				}
+
+				wo, _, _ := st.ReadTensorFloat32(prefix + "self_attn.o_proj.weight")
+				proj := make([]float32, dim)
+				mv(proj, wo, attnOut, dim, dim)
+				for i := 0; i < dim; i++ { x[i] += proj[i] }
+
+				normW2, _, _ := st.ReadTensorFloat32(prefix + "post_attention_layernorm.weight")
+				copy(buf, x)
+				rmsNorm(buf, normW2, normEps)
+
+				gate, _, _ := st.ReadTensorFloat32(prefix + "mlp.gate_proj.weight")
+				up, _, _ := st.ReadTensorFloat32(prefix + "mlp.up_proj.weight")
+				down, _, _ := st.ReadTensorFloat32(prefix + "mlp.down_proj.weight")
+				mv(ffnBuf, gate, buf, ffnDim, dim)
+				mv(ffnBuf2, up, buf, ffnDim, dim)
+				for i := 0; i < ffnDim; i++ {
+					ffnBuf[i] = silu(ffnBuf[i]) * ffnBuf2[i]
+				}
+				downOut := make([]float32, dim)
+				mv(downOut, down, ffnBuf, dim, ffnDim)
+				for i := 0; i < dim; i++ { x[i] += downOut[i] }
+			}
+
+			finalNorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+			rmsNorm(x, finalNorm, normEps)
+			logits := make([]float32, vocabSize)
+			mv(logits, lmHeadData, x, vocabSize, dim)
+			return logits
 		}
 	}
 
@@ -1017,3 +1153,76 @@ func writeSSEChunk(w http.ResponseWriter, flusher http.Flusher, chunk ChatComple
 // Silence unused import warnings. These are used in the handler implementations.
 var _ = bufio.NewScanner
 var _ = mongoose.Engine(nil)
+
+// -----------------------------------------------------------------------
+// Daemon mode
+// -----------------------------------------------------------------------
+
+func servePidPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".ai", "serve.pid")
+}
+
+func daemonize(host, port, modelName string) {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("cannot find self: %v", err)
+	}
+
+	// Kill existing daemon if running
+	stopExistingDaemon()
+
+	args := []string{"serve"}
+	if modelName != "" {
+		args = append(args, fmt.Sprintf("model=%s", modelName))
+	}
+	args = append(args, fmt.Sprintf("host=%s", host), fmt.Sprintf("port=%s", port))
+
+	cmd := exec.Command(exe, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("failed to start daemon: %v", err)
+	}
+
+	pid := cmd.Process.Pid
+
+	home, _ := os.UserHomeDir()
+	os.MkdirAll(filepath.Join(home, ".ai"), 0755)
+	os.WriteFile(servePidPath(), []byte(strconv.Itoa(pid)), 0644)
+
+	fmt.Printf("ai serve daemon started (pid=%d) on %s:%s\n", pid, host, port)
+	if modelName != "" {
+		fmt.Printf("  model: %s\n", modelName)
+	}
+	fmt.Printf("  pid:   %s\n", servePidPath())
+	fmt.Printf("  stop:  ai serve --stop\n")
+}
+
+func stopExistingDaemon() {
+	data, err := os.ReadFile(servePidPath())
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		os.Remove(servePidPath())
+		return
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		os.Remove(servePidPath())
+		return
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		os.Remove(servePidPath())
+		return
+	}
+	proc.Signal(syscall.SIGTERM)
+	time.Sleep(500 * time.Millisecond)
+	proc.Signal(syscall.SIGKILL)
+	os.Remove(servePidPath())
+}
