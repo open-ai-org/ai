@@ -80,18 +80,8 @@ func resolveModelPath(name string) string {
 	return ""
 }
 
-// findData looks for training data in common locations.
+// findData returns empty — data must be explicitly provided.
 func findData() string {
-	candidates := []string{
-		"data/tinystories_hf.txt",
-	}
-	home, _ := os.UserHomeDir()
-	candidates = append(candidates, filepath.Join(home, "data", "tinystories_hf.txt"))
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
-	}
 	return ""
 }
 

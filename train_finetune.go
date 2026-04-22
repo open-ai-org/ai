@@ -32,13 +32,7 @@ func cmdFinetune() {
 		home, _ := os.UserHomeDir()
 		*modelPath = filepath.Join(home, ".ai", "models", "TinyLlama-1.1B-Chat-v1.0")
 	}
-	if *dataPath == "" {
-		*dataPath = "data/tinystories_hf.txt"
-		if _, err := os.Stat(*dataPath); err != nil {
-			home, _ := os.UserHomeDir()
-			*dataPath = filepath.Join(home, "data", "tinystories_hf.txt")
-		}
-	}
+	if *dataPath == "" { log.Fatal("--data flag required: ai train --data <file>") }
 
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)

@@ -7,7 +7,6 @@ import (
 	"math"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -30,13 +29,7 @@ func cmdTrainAny() {
 
 	fs.Parse(os.Args[2:])
 
-	if *dataPath == "" {
-		*dataPath = "data/tinystories_hf.txt"
-		if _, err := os.Stat(*dataPath); err != nil {
-			home, _ := os.UserHomeDir()
-			*dataPath = filepath.Join(home, "data", "tinystories_hf.txt")
-		}
-	}
+	if *dataPath == "" { log.Fatal("--data flag required: ai train --data <file>") }
 
 	eng := selectEngine("auto")
 

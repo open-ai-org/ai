@@ -37,11 +37,7 @@ func cmdTrain() {
 	fs.Parse(os.Args[2:])
 
 	if *dataPath == "" {
-		*dataPath = "data/tinystories_hf.txt"
-		if _, err := os.Stat(*dataPath); err != nil {
-			home, _ := os.UserHomeDir()
-			*dataPath = filepath.Join(home, "data", "tinystories_hf.txt")
-		}
+		log.Fatal("--data flag required: ai train --data <file>")
 	}
 	if *saveDir == "" {
 		home, _ := os.UserHomeDir()
@@ -249,11 +245,7 @@ func cmdResume() {
 		if fs.NArg() > 1 {
 			*dataPath = fs.Arg(1)
 		} else {
-			*dataPath = "data/tinystories_hf.txt"
-			if _, err := os.Stat(*dataPath); err != nil {
-				home, _ := os.UserHomeDir()
-				*dataPath = filepath.Join(home, "data", "tinystories_hf.txt")
-			}
+			log.Fatal("--data flag required: ai train --data <file>")
 		}
 	}
 
