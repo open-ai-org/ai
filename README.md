@@ -97,13 +97,21 @@ ai serve Qwen2.5-0.5B
 
 ## Performance
 
-Inference on Qwen2.5-0.5B:
+### Training convergence — dim=512, RTX 5090
+
+```
+step 1     loss 6.17
+step 100   loss 2.59   floor 2.37
+step 300   loss 2.05   floor 1.76
+step 500   loss 1.95   floor 1.29   365 steps/s
+```
+
+### Inference — Qwen2.5-0.5B (200 tokens)
 
 | Platform | tok/s |
 |----------|-------|
-| PyTorch MPS (M1 Pro) | 3.3 |
-| ai Metal Q8 (M1 Pro) | 57 |
-| ai CUDA Q8 (RTX 5070 Ti) | 99 |
+| RTX 5090 Q8 | 182 |
+| M4 Max | 54 |
 
 - Automatic quantization: Q8 for models <4B params, Q4 for 7B+
 - Metal 4 `matmul2d` TensorOp on macOS 26+
