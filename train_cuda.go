@@ -80,15 +80,22 @@ func cmdTrainCUDA() {
 	}
 	log.Println("[ai] CUDA kernels loaded")
 
-	// Multi-GPU: split layers across devices
-	mc := mongoose.NewMultiCUDA()
+	// Multi-GPU: only init when >1 GPU available
+	var mc *mongoose.MultiCUDA
 	nGPUs := 0
-	if mc != nil {
-		nGPUs = mc.DeviceCount
-		log.Printf("[ai] multi-GPU: %d devices available", nGPUs)
+	devCount := mongoose.CUDADeviceCount()
+	if devCount >= 2 {
+		mc = mongoose.NewMultiCUDA()
+		if mc != nil {
+			nGPUs = mc.DeviceCount
+			log.Printf("[ai] multi-GPU: %d devices available", nGPUs)
+		}
 	}
 
-	sched := mongoose.NewScheduler(eng)
+	var sched *mongoose.Scheduler
+	if nGPUs >= 2 {
+		sched = mongoose.NewScheduler(eng)
+	}
 	_ = sched
 
 	dim := *dimFlag
@@ -237,33 +244,43 @@ func cmdTrainCUDA() {
 		}
 	}
 
-	// FP16 shadows — each on the same device as the FP32 master
+	// Download tensor to host — handles both GPU 0 and remote devices
+	toHost := func(t *mongoose.Tensor, dev int) []float32 {
+		if dev == 0 || !multiGPU {
+			return te.ToHost(t)
+		}
+		return mc.DownloadFP32FromDevice(dev, t.DevicePtr(), t.Size)
+	}
+
+	// FP16 shadows — only when FP16 training is active
 	type fp16W struct{ wq, wk, wv, wo, gate, up, down, norm1, norm2 *mongoose.Tensor }
 	fp16 := make([]fp16W, nLayers)
-	for l := range fp16 {
-		dev := layerDev[l]
-		toFP16 := func(t *mongoose.Tensor) *mongoose.Tensor {
-			if dev == 0 || !multiGPU {
-				return cuda.FromHostFP16(te.ToHost(t), t.Shape)
+	if useFP16Training {
+		for l := range fp16 {
+			dev := layerDev[l]
+			toFP16 := func(t *mongoose.Tensor) *mongoose.Tensor {
+				host := toHost(t, dev)
+				if dev == 0 || !multiGPU {
+					return cuda.FromHostFP16(host, t.Shape)
+				}
+				return mc.FromHostFP16OnDevice(dev, host, t.Shape, cuda.FromHostFP16)
 			}
-			// Convert on GPU 0 then P2P — no host round-trip for the FP16 data
-			host := te.ToHost(t)
-			return mc.FromHostFP16OnDevice(dev, host, t.Shape, cuda.FromHostFP16)
-		}
-		fp16[l] = fp16W{
-			wq: toFP16(lays[l].wq), wk: toFP16(lays[l].wk), wv: toFP16(lays[l].wv),
-			wo: toFP16(lays[l].wo), gate: toFP16(lays[l].gate), up: toFP16(lays[l].up),
-			down: toFP16(lays[l].down), norm1: toFP16(lays[l].norm1), norm2: toFP16(lays[l].norm2),
+			fp16[l] = fp16W{
+				wq: toFP16(lays[l].wq), wk: toFP16(lays[l].wk), wv: toFP16(lays[l].wv),
+				wo: toFP16(lays[l].wo), gate: toFP16(lays[l].gate), up: toFP16(lays[l].up),
+				down: toFP16(lays[l].down), norm1: toFP16(lays[l].norm1), norm2: toFP16(lays[l].norm2),
+			}
 		}
 	}
-	embedFP16 := cuda.FromHostFP16(te.ToHost(embed), embed.Shape)
-	finalNormFP16 := cuda.FromHostFP16(te.ToHost(finalNorm), finalNorm.Shape)
-
-	// FP16 scratch for activation conversion before GEMMs (GPU 0 only, fallback path)
-	maxActSize := n * dim
-	if n*ffnDim > maxActSize { maxActSize = n * ffnDim }
-	if n*vocabSize > maxActSize { maxActSize = n * vocabSize }
-	fp16Scratch := cuda.AllocFP16Tensor(maxActSize, []int{maxActSize})
+	var embedFP16, finalNormFP16, fp16Scratch *mongoose.Tensor
+	if useFP16Training {
+		embedFP16 = cuda.FromHostFP16(te.ToHost(embed), embed.Shape)
+		finalNormFP16 = cuda.FromHostFP16(te.ToHost(finalNorm), finalNorm.Shape)
+		maxActSize := n * dim
+		if n*ffnDim > maxActSize { maxActSize = n * ffnDim }
+		if n*vocabSize > maxActSize { maxActSize = n * vocabSize }
+		fp16Scratch = cuda.AllocFP16Tensor(maxActSize, []int{maxActSize})
+	}
 
 	// Per-device RoPE tables and FP32 scratch for multi-GPU.
 	// Remote-device layers need these on their own GPU — can't cross-device write FP32 scales.
@@ -319,6 +336,7 @@ func cmdTrainCUDA() {
 	// FP32→FP16 sync: each device converts its own master weights locally.
 	// No P2P for weight sync — everything lives on the owning device.
 	syncFP16Weights := func() {
+		if !useFP16Training { return }
 		for l := range lays {
 			dev := layerDev[l]
 			if multiGPU { mongoose.SetDevice(dev) }
@@ -498,13 +516,7 @@ func cmdTrainCUDA() {
 		return minLR + float32(cosine)*float32(lr-minLR)
 	}
 
-	// Download tensor to host — handles both GPU 0 and remote devices
-	toHost := func(t *mongoose.Tensor, dev int) []float32 {
-		if dev == 0 || !multiGPU {
-			return te.ToHost(t)
-		}
-		return mc.DownloadFP32FromDevice(dev, t.DevicePtr(), t.Size)
-	}
+
 
 	var curLR float32 // set each step by signal-scaled getLR
 	adamW := func(param, grad, mS, vS *mongoose.Tensor, step int) {
@@ -547,19 +559,20 @@ func cmdTrainCUDA() {
 		}
 	}
 
-	// Calibrate scheduler on training op shapes
-	sched.CalibrateMatMul(n, dim, dim)       // QKV projections
-	sched.CalibrateMatMul(n, dim, kvDim)     // K/V projections
-	sched.CalibrateMatMul(n, dim, ffnDim)    // FFN gate/up
-	sched.CalibrateMatMul(n, ffnDim, dim)    // FFN down
-	sched.CalibrateMatMul(n, dim, vocabSize) // logits
-	sched.CalibrateAll(mongoose.NormKey(dim), func(e mongoose.Engine) {
-		d := make([]float32, dim)
-		w := make([]float32, dim)
-		for i := range w { w[i] = 1 }
-		e.RMSNorm(d, w, 1e-6)
-	})
-	log.Printf("[scheduler] calibrated %d GPUs, %d op shapes", sched.NumGPUs(), 6)
+	if sched != nil {
+		sched.CalibrateMatMul(n, dim, dim)
+		sched.CalibrateMatMul(n, dim, kvDim)
+		sched.CalibrateMatMul(n, dim, ffnDim)
+		sched.CalibrateMatMul(n, ffnDim, dim)
+		sched.CalibrateMatMul(n, dim, vocabSize)
+		sched.CalibrateAll(mongoose.NormKey(dim), func(e mongoose.Engine) {
+			d := make([]float32, dim)
+			w := make([]float32, dim)
+			for i := range w { w[i] = 1 }
+			e.RMSNorm(d, w, 1e-6)
+		})
+		log.Printf("[scheduler] calibrated %d GPUs, %d op shapes", sched.NumGPUs(), 6)
+	}
 
 	start0 := rng.Intn(len(data) - n - 1)
 	prepBatch(start0)
@@ -730,118 +743,98 @@ func cmdTrainCUDA() {
 
 		if nativeFP16 {
 			// === NATIVE FP16 PATH ===
-			// All intra-layer ops in FP16. hidden/dHidden stay FP32 on GPU 0 for embed/loss.
-			// Multi-GPU: P2P hidden(FP16) to target device at layer boundaries.
-			// 2 conversions per layer (hidden FP32↔FP16) vs 42 in the conversion fallback.
+			// Hidden flows forward as FP16. Stays on whatever device owns the current layer.
+			// Residual adds are device-local via KFP16AddInPlace. P2P only at device boundaries.
+			// One FP32→FP16 conversion at embed, one FP16→FP32 at loss. Zero mid-pipeline conversions.
+
+			// h16 = FP16 hidden state, lives on curDev
+			curDev := 0
+			h16Ptr := h16Scratch.DevicePtr()
+			mongoose.KFP32ToFP16(hidden.DevicePtr(), h16Ptr, n*dim)
 
 			for li := range lays {
 				b := &bufs[li]
 				f := &fp16Bufs[li]
-				dev := 0
-				if multiGPU { dev = layerDev[li] }
+				dev := layerDev[li]
 
-				if !multiGPU || dev == 0 {
-					// === SINGLE-GPU / GPU-0 LAYER ===
-					mongoose.KFP32ToFP16(hidden.DevicePtr(), f.xIn16.DevicePtr(), n*dim)
-					cuda.FP16Copy(f.h16, f.xIn16, n*dim*2)
-
-					mongoose.KRMSNormOutSaveFP16(f.h16.DevicePtr(), f.normed16.DevicePtr(),
-						fp16[li].norm1.DevicePtr(), b.rmsScale1.DevicePtr(), n, dim)
-
-					cuda.MatMulAllFP16TransposeBTInto(f.Q16, f.normed16, fp16[li].wq, n, dim, dim)
-					cuda.MatMulAllFP16TransposeBTInto(f.K16, f.normed16, fp16[li].wk, n, dim, kvDim)
-					cuda.MatMulAllFP16TransposeBTInto(f.V16, f.normed16, fp16[li].wv, n, dim, kvDim)
-
-					mongoose.KRoPEFP16(f.Q16.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
-					mongoose.KRoPEFP16(f.K16.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
-
-					mongoose.KCausalAttentionGQAFP16(f.Q16.DevicePtr(), f.K16.DevicePtr(), f.V16.DevicePtr(),
-						f.attnOut16.DevicePtr(), n, dim, kvDim, heads, kvHeads)
-
-					cuda.MatMulAllFP16TransposeBTInto(f.dx16, f.attnOut16, fp16[li].wo, n, dim, dim)
-					mongoose.KFP32AddFP16(hidden.DevicePtr(), f.dx16.DevicePtr(), n*dim)
-
-					mongoose.KFP32ToFP16(hidden.DevicePtr(), f.xMid16.DevicePtr(), n*dim)
-
-					mongoose.KRMSNormOutSaveFP16(f.xMid16.DevicePtr(), f.normed216.DevicePtr(),
-						fp16[li].norm2.DevicePtr(), b.rmsScale2.DevicePtr(), n, dim)
-
-					cuda.MatMulAllFP16TransposeBTInto(f.gatePre16, f.normed216, fp16[li].gate, n, dim, ffnDim)
-					cuda.MatMulAllFP16TransposeBTInto(f.upOut16, f.normed216, fp16[li].up, n, dim, ffnDim)
-
-					mongoose.KSiLUGateMulFP16(f.gatePre16.DevicePtr(), f.upOut16.DevicePtr(), f.ffnMid16.DevicePtr(), n*ffnDim)
-
-					cuda.MatMulAllFP16TransposeBTInto(f.dx16, f.ffnMid16, fp16[li].down, n, ffnDim, dim)
-					mongoose.KFP32AddFP16(hidden.DevicePtr(), f.dx16.DevicePtr(), n*dim)
-				} else {
-					// === REMOTE GPU LAYER ===
-					// All weights (FP16 + FP32), activations, gradients live on this device.
-					// Only dHidden crosses the wire.
-					dr := &devRes[dev]
-
-					// Convert hidden(FP32)→FP16 on GPU 0, P2P to target device
-					mongoose.KFP32ToFP16(hidden.DevicePtr(), devHidden16[0], n*dim)
-					mc.PeerCopyInto(0, devHidden16[0], dev, devHidden16[dev], n*dim*2)
-					mc.SyncDevice(0)
+				// P2P at device boundary — the ONLY cross-device transfer per transition
+				if multiGPU && dev != curDev {
+					mc.PeerCopyInto(curDev, h16Ptr, dev, f.h16.DevicePtr(), n*dim*2)
+					mc.SyncDevice(curDev)
 					mongoose.SetDevice(dev)
-
-					// Save xIn16 for backward
-					mongoose.KCopy(f.xIn16.DevicePtr(), devHidden16[dev], n*dim*2)
-					mongoose.KCopy(f.h16.DevicePtr(), devHidden16[dev], n*dim*2)
-
-					// RMSNorm — fp16[li] weights are on this device now
-					mongoose.KRMSNormOutSaveFP16(f.h16.DevicePtr(), f.normed16.DevicePtr(),
-						fp16[li].norm1.DevicePtr(), b.rmsScale1.DevicePtr(), n, dim)
-
-					// QKV GEMMs — fp16[li] weights are device-local
-					mc.MatMulFP16TransBOnDevice(dev, f.normed16.DevicePtr(), fp16[li].wq.DevicePtr(), f.Q16.DevicePtr(), n, dim, dim)
-					mc.MatMulFP16TransBOnDevice(dev, f.normed16.DevicePtr(), fp16[li].wk.DevicePtr(), f.K16.DevicePtr(), n, dim, kvDim)
-					mc.MatMulFP16TransBOnDevice(dev, f.normed16.DevicePtr(), fp16[li].wv.DevicePtr(), f.V16.DevicePtr(), n, dim, kvDim)
-
-					mongoose.KRoPEFP16(f.Q16.DevicePtr(), dr.ropeCos, dr.ropeSin, n, dim, headDim, heads)
-					mongoose.KRoPEFP16(f.K16.DevicePtr(), dr.ropeCos, dr.ropeSin, n, kvDim, headDim, kvHeads)
-
-					mongoose.KCausalAttentionGQAFP16(f.Q16.DevicePtr(), f.K16.DevicePtr(), f.V16.DevicePtr(),
-						f.attnOut16.DevicePtr(), n, dim, kvDim, heads, kvHeads)
-
-					mc.MatMulFP16TransBOnDevice(dev, f.attnOut16.DevicePtr(), fp16[li].wo.DevicePtr(), f.dx16.DevicePtr(), n, dim, dim)
-
-					// P2P dx back to GPU 0 for residual
-					mc.PeerCopyInto(dev, f.dx16.DevicePtr(), 0, devHidden16[0], n*dim*2)
-					mc.SyncDevice(dev)
-					mongoose.SetDevice(0)
-					mongoose.KFP32AddFP16(hidden.DevicePtr(), devHidden16[0], n*dim)
-
-					// Save mid-hidden, P2P to target device
-					mongoose.KFP32ToFP16(hidden.DevicePtr(), devHidden16[0], n*dim)
-					mc.PeerCopyInto(0, devHidden16[0], dev, devHidden16[dev], n*dim*2)
-					mc.SyncDevice(0)
-					mongoose.SetDevice(dev)
-					mongoose.KCopy(f.xMid16.DevicePtr(), devHidden16[dev], n*dim*2)
-
-					// Post-attn RMSNorm
-					mongoose.KRMSNormOutSaveFP16(f.xMid16.DevicePtr(), f.normed216.DevicePtr(),
-						fp16[li].norm2.DevicePtr(), b.rmsScale2.DevicePtr(), n, dim)
-
-					mc.MatMulFP16TransBOnDevice(dev, f.normed216.DevicePtr(), fp16[li].gate.DevicePtr(), f.gatePre16.DevicePtr(), n, dim, ffnDim)
-					mc.MatMulFP16TransBOnDevice(dev, f.normed216.DevicePtr(), fp16[li].up.DevicePtr(), f.upOut16.DevicePtr(), n, dim, ffnDim)
-
-					mongoose.KSiLUGateMulFP16(f.gatePre16.DevicePtr(), f.upOut16.DevicePtr(), f.ffnMid16.DevicePtr(), n*ffnDim)
-
-					mc.MatMulFP16TransBOnDevice(dev, f.ffnMid16.DevicePtr(), fp16[li].down.DevicePtr(), f.dx16.DevicePtr(), n, ffnDim, dim)
-
-					// P2P dx back to GPU 0 for residual
-					mc.PeerCopyInto(dev, f.dx16.DevicePtr(), 0, devHidden16[0], n*dim*2)
-					mc.SyncDevice(dev)
-					mongoose.SetDevice(0)
-					mongoose.KFP32AddFP16(hidden.DevicePtr(), devHidden16[0], n*dim)
+					curDev = dev
+					h16Ptr = f.h16.DevicePtr()
 				}
+
+				// Save xIn16 for backward, copy h16 into layer's working buffer
+				mongoose.KCopy(f.xIn16.DevicePtr(), h16Ptr, n*dim*2)
+				if h16Ptr != f.h16.DevicePtr() {
+					mongoose.KCopy(f.h16.DevicePtr(), h16Ptr, n*dim*2)
+				}
+
+				// Device-local pointers
+				cosP, sinP := ropeCos.DevicePtr(), ropeSin.DevicePtr()
+				if multiGPU && dev != 0 {
+					cosP, sinP = devRes[dev].ropeCos, devRes[dev].ropeSin
+				}
+
+				// GEMM dispatch — device-local cuBLAS handle
+				gemmBT16 := func(out, a, w *mongoose.Tensor, m, k, nn int) {
+					if !multiGPU || dev == 0 {
+						cuda.MatMulAllFP16TransposeBTInto(out, a, w, m, k, nn)
+					} else {
+						mc.MatMulFP16TransBOnDevice(dev, a.DevicePtr(), w.DevicePtr(), out.DevicePtr(), m, k, nn)
+					}
+				}
+
+				// === ATTENTION BLOCK ===
+				mongoose.KRMSNormOutSaveFP16(f.h16.DevicePtr(), f.normed16.DevicePtr(),
+					fp16[li].norm1.DevicePtr(), b.rmsScale1.DevicePtr(), n, dim)
+
+				gemmBT16(f.Q16, f.normed16, fp16[li].wq, n, dim, dim)
+				gemmBT16(f.K16, f.normed16, fp16[li].wk, n, dim, kvDim)
+				gemmBT16(f.V16, f.normed16, fp16[li].wv, n, dim, kvDim)
+
+				mongoose.KRoPEFP16(f.Q16.DevicePtr(), cosP, sinP, n, dim, headDim, heads)
+				mongoose.KRoPEFP16(f.K16.DevicePtr(), cosP, sinP, n, kvDim, headDim, kvHeads)
+
+				mongoose.KCausalAttentionGQAFP16(f.Q16.DevicePtr(), f.K16.DevicePtr(), f.V16.DevicePtr(),
+					f.attnOut16.DevicePtr(), n, dim, kvDim, heads, kvHeads)
+
+				gemmBT16(f.dx16, f.attnOut16, fp16[li].wo, n, dim, dim)
+				mongoose.KFP16AddInPlace(f.h16.DevicePtr(), f.dx16.DevicePtr(), n*dim)
+
+				// Save xMid16 for backward
+				mongoose.KCopy(f.xMid16.DevicePtr(), f.h16.DevicePtr(), n*dim*2)
+
+				// === FFN BLOCK ===
+				mongoose.KRMSNormOutSaveFP16(f.h16.DevicePtr(), f.normed216.DevicePtr(),
+					fp16[li].norm2.DevicePtr(), b.rmsScale2.DevicePtr(), n, dim)
+
+				gemmBT16(f.gatePre16, f.normed216, fp16[li].gate, n, dim, ffnDim)
+				gemmBT16(f.upOut16, f.normed216, fp16[li].up, n, dim, ffnDim)
+
+				mongoose.KSiLUGateMulFP16(f.gatePre16.DevicePtr(), f.upOut16.DevicePtr(), f.ffnMid16.DevicePtr(), n*ffnDim)
+
+				gemmBT16(f.dx16, f.ffnMid16, fp16[li].down, n, ffnDim, dim)
+				mongoose.KFP16AddInPlace(f.h16.DevicePtr(), f.dx16.DevicePtr(), n*dim)
+
+				// h16 now lives on this device, ready for next layer
+				h16Ptr = f.h16.DevicePtr()
 			}
 
-			// Ensure we're on GPU 0 for loss computation
-			if multiGPU { mongoose.SetDevice(0) }
+			// h16 is on curDev after last layer. P2P back to GPU 0 if needed for loss.
+			if multiGPU && curDev != 0 {
+				mc.PeerCopyInto(curDev, h16Ptr, 0, h16Scratch.DevicePtr(), n*dim*2)
+				mc.SyncDevice(curDev)
+				mongoose.SetDevice(0)
+				h16Ptr = h16Scratch.DevicePtr()
+			}
 
-			// Final RMSNorm: FP32 hidden → FP16 normedFinal → FP32 logits (loss needs FP32)
+			// FP16→FP32 for loss computation on GPU 0
+			mongoose.KFP16ToFP32(h16Ptr, hidden.DevicePtr(), n*dim)
+
+			// Final RMSNorm + logits
 			mongoose.KFP32ToFP16(hidden.DevicePtr(), h16Scratch.DevicePtr(), n*dim)
 			mongoose.KRMSNormOutSaveFP16(h16Scratch.DevicePtr(), normedFinal16.DevicePtr(),
 				finalNormFP16.DevicePtr(), finalScales.DevicePtr(), n, dim)
@@ -873,46 +866,51 @@ func cmdTrainCUDA() {
 				finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
 			cuda.CopyInto(dHidden, dScratch)
 
+			// dH16 flows backward as FP16. P2P only at device boundaries.
+			// dW gradient GEMMs output FP32 and stay on the owning device.
+			curDev = 0
+			dH16Ptr := h16Scratch.DevicePtr()
+			mongoose.KFP32ToFP16(dHidden.DevicePtr(), dH16Ptr, n*dim)
+
 			for li := nLayers - 1; li >= 0; li-- {
 				b := &bufs[li]
 				f := &fp16Bufs[li]
 				dev := layerDev[li]
-				remote := multiGPU && dev != 0
 
-				// dH: device-local FP32 dHidden accumulator
-				// GPU 0 → dHidden directly. Remote → b.dx as local copy.
-				var dH *mongoose.Tensor
-				if remote {
-					mongoose.KFP32ToFP16(dHidden.DevicePtr(), devHidden16[0], n*dim)
-					mc.PeerCopyInto(0, devHidden16[0], dev, devHidden16[dev], n*dim*2)
-					mc.SyncDevice(0)
+				// P2P at device boundary (reverse direction)
+				if multiGPU && dev != curDev {
+					mc.PeerCopyInto(curDev, dH16Ptr, dev, f.dH16.DevicePtr(), n*dim*2)
+					mc.SyncDevice(curDev)
 					mongoose.SetDevice(dev)
-					mongoose.KFP16ToFP32(devHidden16[dev], b.dx.DevicePtr(), n*dim)
-					dH = b.dx
-				} else {
-					dH = dHidden
+					curDev = dev
+					dH16Ptr = f.dH16.DevicePtr()
+				} else if dH16Ptr != f.dH16.DevicePtr() {
+					mongoose.KCopy(f.dH16.DevicePtr(), dH16Ptr, n*dim*2)
 				}
 
-				mongoose.KFP32ToFP16(dH.DevicePtr(), f.dH16.DevicePtr(), n*dim)
+				cosP, sinP := ropeCos.DevicePtr(), ropeSin.DevicePtr()
+				if multiGPU && dev != 0 {
+					cosP, sinP = devRes[dev].ropeCos, devRes[dev].ropeSin
+				}
 
+				// Device-local GEMM dispatch
 				gemmFP16 := func(out, a, b16 *mongoose.Tensor, m, k, nn int) {
-					if !remote {
+					if !multiGPU || dev == 0 {
 						cuda.MatMulFP16Into(out, a, b16, m, k, nn)
 					} else {
 						mc.MatMulFP16FP32OutOnDevice(dev, a.DevicePtr(), b16.DevicePtr(), out.DevicePtr(), m, k, nn)
 					}
 				}
 				gemmFP16TransA := func(out, a, b16 *mongoose.Tensor, m, k, nn int) {
-					if !remote {
+					if !multiGPU || dev == 0 {
 						cuda.MatMulFP16TransposeATInto(out, a, b16, m, k, nn)
 					} else {
 						mc.MatMulFP16TransAFP32OutOnDevice(dev, a.DevicePtr(), b16.DevicePtr(), out.DevicePtr(), m, k, nn)
 					}
 				}
-				cosP, sinP := ropeCos.DevicePtr(), ropeSin.DevicePtr()
-				if remote { cosP, sinP = devRes[dev].ropeCos, devRes[dev].ropeSin }
 
-				// FFN backward
+				// === FFN BACKWARD ===
+				// dH16 is FP16. dW GEMMs need FP16 in → FP32 out. dAct GEMMs need FP16 in → FP32 out.
 				gemmFP16(b.dFfnMid, f.dH16, fp16[li].down, n, dim, ffnDim)
 				gemmFP16TransA(b.dWDown, f.dH16, f.ffnMid16, n, dim, ffnDim)
 
@@ -927,20 +925,22 @@ func cmdTrainCUDA() {
 				gemmFP16TransA(b.dWGate, f.dGate16, f.normed216, n, ffnDim, dim)
 				gemmFP16TransA(b.dWUp, f.dUp16, f.normed216, n, ffnDim, dim)
 
-				// RMSNorm backward (post-attn)
+				// RMSNorm backward (post-attn): FP32 kernel, device-local
 				mongoose.KFP16ToFP32(f.xMid16.DevicePtr(), b.xMid.DevicePtr(), n*dim)
 				mongoose.KZero(b.dN1.DevicePtr(), b.dN1.Size*4)
 				mongoose.KRMSNormBackward(b.dN2.DevicePtr(), b.xMid.DevicePtr(),
 					lays[li].norm2.DevicePtr(), b.rmsScale2.DevicePtr(), b.dN1.DevicePtr(), n, dim)
-				mongoose.KAddInPlace(dH.DevicePtr(), b.dN1.DevicePtr(), n*dim)
+				// dN1 is FP32 RMSNorm result → convert to FP16, add to dH16
+				mongoose.KFP32ToFP16(b.dN1.DevicePtr(), f.dx16.DevicePtr(), n*dim)
+				mongoose.KFP16AddInPlace(f.dH16.DevicePtr(), f.dx16.DevicePtr(), n*dim)
 
-				// Updated dHidden → FP16
-				mongoose.KFP32ToFP16(dH.DevicePtr(), f.dH16.DevicePtr(), n*dim)
+				// Updated dH16 for attention backward GEMMs (already in f.dH16)
 
-				// Attention backward
+				// === ATTENTION BACKWARD ===
 				gemmFP16(b.dAttnOut, f.dH16, fp16[li].wo, n, dim, dim)
 				gemmFP16TransA(b.dWO, f.dH16, f.attnOut16, n, dim, dim)
 
+				// Attention backward kernel is FP32 — convert saved FP16 activations
 				mongoose.KFP16ToFP32(f.Q16.DevicePtr(), b.Q.DevicePtr(), n*dim)
 				mongoose.KFP16ToFP32(f.K16.DevicePtr(), b.K.DevicePtr(), n*kvDim)
 				mongoose.KFP16ToFP32(f.V16.DevicePtr(), b.V.DevicePtr(), n*kvDim)
@@ -953,6 +953,7 @@ func cmdTrainCUDA() {
 				mongoose.KRoPEBackward(b.dQ.DevicePtr(), cosP, sinP, n, dim, headDim, heads)
 				mongoose.KRoPEBackward(b.dK.DevicePtr(), cosP, sinP, n, kvDim, headDim, kvHeads)
 
+				// dN1 = dQ @ wq + dK @ wk + dV @ wv (FP16 in → FP32 out)
 				mongoose.KFP32ToFP16(b.dQ.DevicePtr(), f.dQ16.DevicePtr(), n*dim)
 				mongoose.KFP32ToFP16(b.dK.DevicePtr(), f.dK16.DevicePtr(), n*kvDim)
 				mongoose.KFP32ToFP16(b.dV.DevicePtr(), f.dV16.DevicePtr(), n*kvDim)
@@ -962,27 +963,31 @@ func cmdTrainCUDA() {
 				gemmFP16(b.dN2, f.dV16, fp16[li].wv, n, kvDim, dim)
 				mongoose.KAddInPlace(b.dN1.DevicePtr(), b.dN2.DevicePtr(), b.dN1.Size)
 
+				// dW for Q/K/V
 				gemmFP16TransA(b.dWQ, f.dQ16, f.normed16, n, dim, dim)
 				gemmFP16TransA(b.dWK, f.dK16, f.normed16, n, kvDim, dim)
 				gemmFP16TransA(b.dWV, f.dV16, f.normed16, n, kvDim, dim)
 
-				// RMSNorm backward (pre-attn)
+				// RMSNorm backward (pre-attn): FP32, device-local
 				mongoose.KFP16ToFP32(f.xIn16.DevicePtr(), b.xIn.DevicePtr(), n*dim)
 				mongoose.KZero(b.dN2.DevicePtr(), b.dN2.Size*4)
 				mongoose.KRMSNormBackward(b.dN1.DevicePtr(), b.xIn.DevicePtr(),
 					lays[li].norm1.DevicePtr(), b.rmsScale1.DevicePtr(), b.dN2.DevicePtr(), n, dim)
-				mongoose.KAddInPlace(dH.DevicePtr(), b.dN2.DevicePtr(), n*dim)
+				mongoose.KFP32ToFP16(b.dN2.DevicePtr(), f.dx16.DevicePtr(), n*dim)
+				mongoose.KFP16AddInPlace(f.dH16.DevicePtr(), f.dx16.DevicePtr(), n*dim)
 
-				if remote {
-					// P2P dH back to GPU 0
-					mongoose.KFP32ToFP16(dH.DevicePtr(), devHidden16[dev], n*dim)
-					mc.PeerCopyInto(dev, devHidden16[dev], 0, devHidden16[0], n*dim*2)
-					mc.SyncDevice(dev)
-					mongoose.SetDevice(0)
-					mongoose.KFP16ToFP32(devHidden16[0], dHidden.DevicePtr(), n*dim)
-				}
+				// dH16 now has accumulated gradient for this layer, ready for next
+				dH16Ptr = f.dH16.DevicePtr()
 			}
-			if multiGPU { mongoose.SetDevice(0) }
+
+			// dH16 is on curDev. Convert back to FP32 on GPU 0 for embed gradient.
+			if multiGPU && curDev != 0 {
+				mc.PeerCopyInto(curDev, dH16Ptr, 0, h16Scratch.DevicePtr(), n*dim*2)
+				mc.SyncDevice(curDev)
+				mongoose.SetDevice(0)
+				dH16Ptr = h16Scratch.DevicePtr()
+			}
+			mongoose.KFP16ToFP32(dH16Ptr, dHidden.DevicePtr(), n*dim)
 		} else {
 			for li := range lays {
 				l := &lays[li]
