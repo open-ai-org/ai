@@ -519,10 +519,6 @@ func cmdTrainCUDA() {
 
 
 	var curLR float32 // set each step by signal-scaled getLR
-	adamW := func(param, grad, mS, vS *mongoose.Tensor, step int) {
-		mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mS.DevicePtr(), vS.DevicePtr(),
-			curLR, 0.1, step, param.Size)
-	}
 
 	zero := func(t *mongoose.Tensor) {
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
@@ -1205,39 +1201,36 @@ func cmdTrainCUDA() {
 			// Optimizer runs on the device that owns this layer
 			if multiGPU { mongoose.SetDevice(dev) }
 
-			// gate↔up: GC pair (3 H-bonds)
-			mongoose.KHelixDNAStep(
-				l.gate.DevicePtr(), l.up.DevicePtr(),
-				b.dWGate.DevicePtr(), b.dWUp.DevicePtr(),
-				la.gate.m.DevicePtr(), la.up.m.DevicePtr(),
-				la.gate.v.DevicePtr(), la.up.v.DevicePtr(),
-				curLR, 0.9, 0.95, step, 1e-8, 0.1,
-				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-				3.0/5.0, l.gate.Size)
-
-			// wq↔wk: AT pair (2 H-bonds) — only when same size
-			if l.wq.Size == l.wk.Size {
+			helixPair := func(w1, w2, g1, g2, m1, m2, v1, v2 *mongoose.Tensor, bond float32, sz int) {
 				mongoose.KHelixDNAStep(
-					l.wq.DevicePtr(), l.wk.DevicePtr(),
-					b.dWQ.DevicePtr(), b.dWK.DevicePtr(),
-					la.wq.m.DevicePtr(), la.wk.m.DevicePtr(),
-					la.wq.v.DevicePtr(), la.wk.v.DevicePtr(),
+					w1.DevicePtr(), w2.DevicePtr(),
+					g1.DevicePtr(), g2.DevicePtr(),
+					m1.DevicePtr(), m2.DevicePtr(),
+					v1.DevicePtr(), v2.DevicePtr(),
 					curLR, 0.9, 0.95, step, 1e-8, 0.1,
 					r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-					2.0/5.0, l.wq.Size)
-			} else {
-				adamW(l.wq, b.dWQ, la.wq.m, la.wq.v, step)
-				adamW(l.wk, b.dWK, la.wk.m, la.wk.v, step)
+					bond, sz)
 			}
 
-			// Singles
-			adamW(l.wv, b.dWV, la.wv.m, la.wv.v, step)
-			adamW(l.wo, b.dWO, la.wo.m, la.wo.v, step)
-			adamW(l.down, b.dWDown, la.down.m, la.down.v, step)
+			// gate↔up: GC pair (3 H-bonds)
+			helixPair(l.gate, l.up, b.dWGate, b.dWUp, la.gate.m, la.up.m, la.gate.v, la.up.v, 3.0/5.0, l.gate.Size)
+
+			// wq↔wk: AT pair (2 H-bonds) when same size, AdamW singles when GQA
+			if l.wq.Size == l.wk.Size {
+				helixPair(l.wq, l.wk, b.dWQ, b.dWK, la.wq.m, la.wk.m, la.wq.v, la.wk.v, 2.0/5.0, l.wq.Size)
+			} else {
+				mongoose.KAdamW(l.wq.DevicePtr(), b.dWQ.DevicePtr(), la.wq.m.DevicePtr(), la.wq.v.DevicePtr(), curLR, 0.1, step, l.wq.Size)
+				mongoose.KAdamW(l.wk.DevicePtr(), b.dWK.DevicePtr(), la.wk.m.DevicePtr(), la.wk.v.DevicePtr(), curLR, 0.1, step, l.wk.Size)
+			}
+
+			// Singles: AdamW with rung-modulated curLR (curLR already has Helix signal scaling)
+			mongoose.KAdamW(l.wv.DevicePtr(), b.dWV.DevicePtr(), la.wv.m.DevicePtr(), la.wv.v.DevicePtr(), curLR, 0.1, step, l.wv.Size)
+			mongoose.KAdamW(l.wo.DevicePtr(), b.dWO.DevicePtr(), la.wo.m.DevicePtr(), la.wo.v.DevicePtr(), curLR, 0.1, step, l.wo.Size)
+			mongoose.KAdamW(l.down.DevicePtr(), b.dWDown.DevicePtr(), la.down.m.DevicePtr(), la.down.v.DevicePtr(), curLR, 0.1, step, l.down.Size)
 		}
 		if multiGPU { mongoose.SetDevice(0) }
 
-		adamW(embed, dEmbed, embedAS.m, embedAS.v, step)
+		mongoose.KAdamW(embed.DevicePtr(), dEmbed.DevicePtr(), embedAS.m.DevicePtr(), embedAS.v.DevicePtr(), curLR, 0.1, step, embed.Size)
 
 		// Sync FP32 master weights → FP16 for next forward
 		syncFP16Weights()
