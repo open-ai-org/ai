@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # macOS Apple Silicon (Metal)
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            cgo: 1
+            suffix: darwin-arm64
+          # macOS Intel
+          - os: macos-13
+            goos: darwin
+            goarch: amd64
+            cgo: 1
+            suffix: darwin-amd64
+          # Linux x86_64 (CUDA + WebGPU)
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cgo: 0
+            suffix: linux-amd64
+          # Linux ARM64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            cgo: 0
+            suffix: linux-arm64
+          # Windows
+          - os: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            cgo: 0
+            suffix: windows-amd64
+            ext: .exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          go build -ldflags="-s -w" -o ai-${{ matrix.suffix }}${{ matrix.ext }} .
+
+      - name: Package Metal kernels (macOS)
+        if: matrix.goos == 'darwin'
+        run: |
+          # Clone mongoose for metallib files
+          git clone --depth 1 https://github.com/open-ai-org/mongoose.git /tmp/mongoose
+          if [ -f /tmp/mongoose/kernels/gemm_metal4.metallib ]; then
+            cp /tmp/mongoose/kernels/gemm_metal4.metallib .
+            cp /tmp/mongoose/kernels/fused_train.metallib .
+            tar czf ai-${{ matrix.suffix }}.tar.gz ai-${{ matrix.suffix }} gemm_metal4.metallib fused_train.metallib
+          else
+            tar czf ai-${{ matrix.suffix }}.tar.gz ai-${{ matrix.suffix }}
+          fi
+
+      - name: Package (non-macOS)
+        if: matrix.goos != 'darwin'
+        run: |
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip ai-${{ matrix.suffix }}.zip ai-${{ matrix.suffix }}${{ matrix.ext }}
+          else
+            tar czf ai-${{ matrix.suffix }}.tar.gz ai-${{ matrix.suffix }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-${{ matrix.suffix }}
+          path: |
+            ai-${{ matrix.suffix }}.tar.gz
+            ai-${{ matrix.suffix }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ai-darwin-arm64.tar.gz
+            ai-darwin-amd64.tar.gz
+            ai-linux-amd64.tar.gz
+            ai-linux-arm64.tar.gz
+            ai-windows-amd64.zip
