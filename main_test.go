@@ -97,7 +97,7 @@ func TestDetectBestBackend(t *testing.T) {
 	backend := detectBestBackend()
 	// Just verify it returns a valid string
 	switch backend {
-	case "cuda-kernels", "graph", "cpu":
+	case "cuda-kernels", "metal", "cpu":
 		// ok
 	default:
 		t.Errorf("detectBestBackend() = %q, want one of cuda-kernels/graph/cpu", backend)

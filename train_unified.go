@@ -96,8 +96,10 @@ func runFromScratch(dataPath string, args map[string]string) {
 		log.Println("[ai] using CUDA kernel path")
 		injectArgs(args, dataPath)
 		cmdTrainCUDA()
-	case "graph":
-		log.Fatal("[ai] Metal fused kernel path in progress — use 'cuda' or default")
+	case "metal":
+		log.Println("[ai] using Metal kernel path")
+		injectArgs(args, dataPath)
+		cmdTrainMetal()
 	default:
 		log.Println("[ai] using universal CPU path")
 		injectArgs(args, dataPath)
@@ -111,32 +113,75 @@ func detectBestBackend() string {
 	case runtime.GOOS == "linux":
 		return "cuda-kernels"
 	case runtime.GOOS == "darwin":
-		return "graph"
+		return "metal"
 	default:
 		return "cpu"
 	}
 }
 
 // runFinetune fine-tunes a pretrained model.
+// Routes to the best available backend — CUDA uses cmdFinetune (INT8 + Helix),
+// Metal uses cmdTrainMetal with --resume pointing at the pretrained weights.
 func runFinetune(modelPath, dataPath string, args map[string]string) {
-	// Build os.Args for cmdFinetune
-	var finetuneArgs []string
-	finetuneArgs = append(finetuneArgs, os.Args[0], "finetune")
-	finetuneArgs = append(finetuneArgs, "--model", modelPath)
-	finetuneArgs = append(finetuneArgs, "--data", dataPath)
+	backend := detectBestBackend()
 
+	switch backend {
+	case "cuda-kernels":
+		var finetuneArgs []string
+		finetuneArgs = append(finetuneArgs, os.Args[0], "finetune")
+		finetuneArgs = append(finetuneArgs, "--model", modelPath)
+		finetuneArgs = append(finetuneArgs, "--data", dataPath)
+		if v, ok := args["steps"]; ok {
+			finetuneArgs = append(finetuneArgs, "--steps", v)
+		}
+		if v, ok := args["lr"]; ok {
+			finetuneArgs = append(finetuneArgs, "--lr", v)
+		}
+		if v, ok := args["log"]; ok {
+			finetuneArgs = append(finetuneArgs, "--log-every", v)
+		}
+		os.Args = finetuneArgs
+		cmdFinetune()
+
+	case "metal":
+		args["resume"] = modelPath
+		injectArgs(args, dataPath)
+		cmdTrainMetal()
+
+	default:
+		log.Fatalf("finetune requires CUDA or Metal (detected: %s)", backend)
+	}
+}
+
+// cmdResumeKV wraps resume with key=value arg support.
+//
+//	ai resume checkpoint=./checkpoints data=corpus.txt
+//	ai resume data=corpus.txt steps=500
+func cmdResumeKV(args map[string]string) {
+	var resumeArgs []string
+	resumeArgs = append(resumeArgs, os.Args[0], "resume")
+
+	if v, ok := args["checkpoint"]; ok {
+		resumeArgs = append(resumeArgs, "--checkpoint", v)
+	} else if v, ok := args["_0"]; ok {
+		resumeArgs = append(resumeArgs, "--checkpoint", v)
+	}
+
+	if v, ok := args["data"]; ok {
+		resumeArgs = append(resumeArgs, "--data", v)
+	}
 	if v, ok := args["steps"]; ok {
-		finetuneArgs = append(finetuneArgs, "--steps", v)
+		resumeArgs = append(resumeArgs, "--steps", v)
 	}
 	if v, ok := args["lr"]; ok {
-		finetuneArgs = append(finetuneArgs, "--lr", v)
+		resumeArgs = append(resumeArgs, "--lr", v)
 	}
 	if v, ok := args["log"]; ok {
-		finetuneArgs = append(finetuneArgs, "--log-every", v)
+		resumeArgs = append(resumeArgs, "--log-every", v)
 	}
 
-	os.Args = finetuneArgs
-	cmdFinetune()
+	os.Args = resumeArgs
+	cmdResume()
 }
 
 // injectArgs rewrites os.Args for the legacy flag-based commands.
@@ -155,6 +200,7 @@ func injectArgs(args map[string]string, dataPath string) {
 		"steps":  "--steps",
 		"lr":     "--lr",
 		"log":    "--log-every",
+		"resume": "--resume",
 	}
 
 	for k, flag := range kvToFlag {

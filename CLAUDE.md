@@ -38,8 +38,8 @@ ai chat Qwen2.5-0.5B               # interactive chat
 ai infer Qwen2.5-0.5B "Hello"      # generate text
 ai serve Qwen2.5-0.5B              # OpenAI-compatible API
 ai train data=corpus.txt            # train from scratch
-ai finetune model=Qwen2.5-0.5B data=corpus.txt
-ai resume checkpoint=./checkpoints  # continue training
+ai train model=Qwen2.5-0.5B data=corpus.txt  # fine-tune
+ai resume checkpoint=./checkpoints data=corpus.txt
 ai quantize Qwen2.5-0.5B q8        # quantize to INT8 GGUF
 ai prune Qwen2.5-0.5B              # remove 50% of weights
 ai explain Qwen2.5-0.5B "prompt"   # token attribution
@@ -58,7 +58,7 @@ ai dataset split corpus.txt         # train/val/test split
   - GPU-resident tier 2: cuBLAS/MPS matmul + CPU attention
   - CPU streaming tier 3: pure Go fallback
 - `infer.go` — CPU-only text generation
-- `chat.go` — interactive chat REPL with ChatML/Llama3 template detection
+- `chat.go` — interactive chat TUI (bubbletea) with ChatML/Llama3 template detection, --verbose for raw debug
 - `serve.go` — OpenAI-compatible API server (chat, completions, embeddings)
 - `train_unified.go` — unified training entry point (dispatches to backend)
 - `train_cuda.go` — CUDA training with helix optimizer

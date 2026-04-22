@@ -1,19 +1,39 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/mongoose"
 	"github.com/open-ai-org/tokenizer"
 )
+
+func suppressOutput() (restore func()) {
+	origStderr, _ := syscall.Dup(2)
+	devNull, _ := os.Open(os.DevNull)
+	syscall.Dup2(int(devNull.Fd()), 2)
+	devNull.Close()
+
+	origLog := log.Writer()
+	log.SetOutput(io.Discard)
+
+	return func() {
+		syscall.Dup2(origStderr, 2)
+		syscall.Close(origStderr)
+		log.SetOutput(origLog)
+	}
+}
 
 type chatMessage struct {
 	Role    string
@@ -21,15 +41,10 @@ type chatMessage struct {
 }
 
 func applyChatTemplate(tok *tokenizer.Tokenizer, messages []chatMessage, cfg map[string]interface{}) []int {
-	// Try to detect the chat format from tokenizer_config.json chat_template
-	// Support: ChatML (Qwen, Yi), Llama3, Mistral, generic fallback
-
-	// Check for common special tokens
 	hasIMStart := tok.HasToken("<|im_start|>")
 	hasBeginOfText := tok.HasToken("<|begin_of_text|>")
 
 	if hasIMStart {
-		// ChatML format (Qwen, Yi, etc.)
 		var sb strings.Builder
 		for _, m := range messages {
 			sb.WriteString("<|im_start|>")
@@ -43,7 +58,6 @@ func applyChatTemplate(tok *tokenizer.Tokenizer, messages []chatMessage, cfg map
 	}
 
 	if hasBeginOfText {
-		// Llama 3 format
 		var sb strings.Builder
 		sb.WriteString("<|begin_of_text|>")
 		for _, m := range messages {
@@ -57,7 +71,6 @@ func applyChatTemplate(tok *tokenizer.Tokenizer, messages []chatMessage, cfg map
 		return tok.Encode(sb.String())
 	}
 
-	// Generic fallback: just concatenate with role markers
 	var sb strings.Builder
 	for _, m := range messages {
 		sb.WriteString(fmt.Sprintf("### %s:\n%s\n\n", strings.Title(m.Role), m.Content))
@@ -67,14 +80,11 @@ func applyChatTemplate(tok *tokenizer.Tokenizer, messages []chatMessage, cfg map
 }
 
 func resolveModelName(name string) string {
-	// Support Ollama-style names: llama3:latest, qwen2.5:0.5b, org/model
-	// Strip :tag if present
 	cleanName := name
 	if idx := strings.LastIndex(name, ":"); idx > 0 {
 		cleanName = name[:idx]
 	}
 
-	// Check if it's a direct path
 	if _, err := os.Stat(cleanName); err == nil {
 		return cleanName
 	}
@@ -94,7 +104,6 @@ func resolveModelName(name string) string {
 		}
 	}
 
-	// Fuzzy match across all model dirs
 	lower := strings.ToLower(cleanName)
 	for _, d := range dirs {
 		entries, err := os.ReadDir(d)
@@ -122,10 +131,97 @@ func resolveModelName(name string) string {
 	return ""
 }
 
-func cmdChat(modelArg string) {
+// discoverStopTokens finds all stop/EOS token IDs from the model's config files
+// and tokenizer vocabulary. Works for any model — no hardcoded token strings.
+func discoverStopTokens(tok *tokenizer.Tokenizer, cfg map[string]interface{}, modelDir string) map[int]bool {
+	stop := map[int]bool{0: true}
+
+	// 1. eos_token_id from config.json — can be int or []int
+	if v, ok := cfg["eos_token_id"]; ok {
+		switch eos := v.(type) {
+		case float64:
+			stop[int(eos)] = true
+		case []interface{}:
+			for _, id := range eos {
+				if f, ok := id.(float64); ok {
+					stop[int(f)] = true
+				}
+			}
+		}
+	}
+
+	// 2. generation_config.json — may have eos_token_id as list
+	if genData, err := os.ReadFile(filepath.Join(modelDir, "generation_config.json")); err == nil {
+		var gen map[string]interface{}
+		if json.Unmarshal(genData, &gen) == nil {
+			if v, ok := gen["eos_token_id"]; ok {
+				switch eos := v.(type) {
+				case float64:
+					stop[int(eos)] = true
+				case []interface{}:
+					for _, id := range eos {
+						if f, ok := id.(float64); ok {
+							stop[int(f)] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3. tokenizer_config.json — eos_token string → resolve to ID
+	if tokCfgData, err := os.ReadFile(filepath.Join(modelDir, "tokenizer_config.json")); err == nil {
+		var tokCfg map[string]interface{}
+		if json.Unmarshal(tokCfgData, &tokCfg) == nil {
+			if eosStr, ok := tokCfg["eos_token"].(string); ok && tok.HasToken(eosStr) {
+				stop[tok.Vocab[eosStr]] = true
+			}
+		}
+	}
+
+	// 4. Tokenizer EOS field
+	if tok.EOS > 0 {
+		stop[tok.EOS] = true
+	}
+
+	// 5. Scan vocab for known end-of-turn patterns — covers any model
+	endPatterns := []string{
+		"<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>",
+		"<|end|>", "</s>", "<|end_of_turn|>", "<|stop|>",
+		"<|end_header_id|>",
+	}
+	for _, pat := range endPatterns {
+		if tok.HasToken(pat) {
+			stop[tok.Vocab[pat]] = true
+		}
+	}
+
+	// 6. Chat template implies stop tokens — ChatML uses im_end, Llama3 uses eot_id
+	//    These are already covered by the vocab scan above, but add im_start too
+	//    so we never generate a new turn header
+	if tok.HasToken("<|im_start|>") {
+		stop[tok.Vocab["<|im_start|>"]] = true
+	}
+
+	return stop
+}
+
+// chatEngine holds the loaded model and inference function.
+type chatEngine struct {
+	fwd        func(tokenID, pos int) []float32
+	resetKV    func()
+	tok        *tokenizer.Tokenizer
+	cfg        map[string]interface{}
+	embedData  []float32
+	stopTokens map[int]bool
+	maxSeq     int
+	modelName  string
+	engineName string
+}
+
+func buildChatEngine(modelArg string) *chatEngine {
 	path := resolveModelName(modelArg)
 	if path == "" {
-		// Try pulling it
 		fmt.Printf("Model '%s' not found locally. Try: ai pull <org/model>\n", modelArg)
 		os.Exit(1)
 	}
@@ -194,9 +290,10 @@ func cmdChat(modelArg string) {
 		}
 	}
 
-	// Set up forward pass
 	var fwd func(tokenID, pos int) []float32
+	var resetKV func()
 
+	// Metal fused compute shaders
 	if metal, ok := eng.(*mongoose.Metal); ok {
 		ret := metal.BuildFused(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, maxSeq)
 		if ret == 0 {
@@ -219,212 +316,467 @@ func cmdChat(modelArg string) {
 					wi++
 				}
 				loadW("input_layernorm.weight")
-				loadW("self_attn.q_proj.weight")
-				loadW("self_attn.k_proj.weight")
-				loadW("self_attn.v_proj.weight")
-				loadB("self_attn.q_proj.bias", dim)
-				loadB("self_attn.k_proj.bias", kvDim)
-				loadB("self_attn.v_proj.bias", kvDim)
-				loadW("self_attn.o_proj.weight")
-				loadW("post_attention_layernorm.weight")
-				loadW("mlp.gate_proj.weight")
-				loadW("mlp.up_proj.weight")
-				loadW("mlp.down_proj.weight")
+				loadW("self_attn.q_proj.weight"); loadW("self_attn.k_proj.weight"); loadW("self_attn.v_proj.weight")
+				loadB("self_attn.q_proj.bias", dim); loadB("self_attn.k_proj.bias", kvDim); loadB("self_attn.v_proj.bias", kvDim)
+				loadW("self_attn.o_proj.weight"); loadW("post_attention_layernorm.weight")
+				loadW("mlp.gate_proj.weight"); loadW("mlp.up_proj.weight"); loadW("mlp.down_proj.weight")
 			}
 			fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
-			metal.FusedSetWeight(wi, fnorm)
-			wi++
-			metal.FusedSetWeight(wi, lmHeadData)
-			wi++
+			metal.FusedSetWeight(wi, fnorm); wi++
+			metal.FusedSetWeight(wi, lmHeadData); wi++
 
 			fHidden := make([]float32, dim)
 			fLogits := make([]float32, vocabSize)
 			fwd = func(tokenID, pos int) []float32 {
 				tokOff := tokenID * dim
-				if tokOff+dim > len(embedData) {
-					return nil
-				}
+				if tokOff+dim > len(embedData) { return nil }
 				copy(fHidden, embedData[tokOff:tokOff+dim])
 				metal.FusedStep(fHidden, cosTab[pos*halfHead:pos*halfHead+halfHead],
 					sinTab[pos*halfHead:pos*halfHead+halfHead], pos, fLogits)
 				return fLogits
 			}
+			resetKV = func() { metal.FusedInferReset() }
 		}
 	}
 
-	// CUDA Q8 path
+	// Metal inference graph fallback
 	if fwd == nil {
-		if _, ok := eng.(*mongoose.CUDA); ok && mongoose.HasQ8Matvec() && mongoose.KernelsLoaded() {
-			te := mongoose.AsTensorEngine(eng)
-			if te != nil {
-				// Reuse the same Q8 quantize-on-load logic from infer_gpu.go
-				// For now, fall through to tier 2
+		if metal, ok := eng.(*mongoose.Metal); ok {
+			ret := metal.BuildInferGraph(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, float64(ropeTheta))
+			if ret == 0 {
+				wi := 0
+				for l := 0; l < nLayers; l++ {
+					prefix := fmt.Sprintf("model.layers.%d.", l)
+					loadW := func(n string) {
+						d, _, _ := st.ReadTensorFloat32(prefix + n)
+						if d != nil { metal.InferSetWeight(wi, d) }
+						wi++
+					}
+					loadB := func(n string, sz int) {
+						d, _, _ := st.ReadTensorFloat32(prefix + n)
+						if d == nil { d = make([]float32, sz) }
+						metal.InferSetWeight(wi, d)
+						wi++
+					}
+					loadW("input_layernorm.weight")
+					loadW("self_attn.q_proj.weight"); loadW("self_attn.k_proj.weight"); loadW("self_attn.v_proj.weight")
+					loadB("self_attn.q_proj.bias", dim); loadB("self_attn.k_proj.bias", kvDim); loadB("self_attn.v_proj.bias", kvDim)
+					loadW("self_attn.o_proj.weight"); loadW("post_attention_layernorm.weight")
+					loadW("mlp.gate_proj.weight"); loadW("mlp.up_proj.weight"); loadW("mlp.down_proj.weight")
+				}
+				fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+				metal.InferSetWeight(wi, fnorm); wi++
+				metal.InferSetWeight(wi, lmHeadData); wi++
+
+				keyCache := make([][]float32, nLayers)
+				valCache := make([][]float32, nLayers)
+				for l := 0; l < nLayers; l++ {
+					keyCache[l] = make([]float32, maxSeq*kvDim)
+					valCache[l] = make([]float32, maxSeq*kvDim)
+				}
+				att := make([]float32, heads*maxSeq)
+				mHidden := make([]float32, dim)
+				mQBuf := make([]float32, dim)
+				mKBuf := make([]float32, kvDim)
+				mVBuf := make([]float32, kvDim)
+				mAttnOut := make([]float32, dim)
+				mLogits := make([]float32, vocabSize)
+				invSqrtHeadDim := float32(1.0 / math.Sqrt(float64(headDim)))
+				kvMulConst := heads / kvHeads
+
+				resetKV = func() {
+					for l := 0; l < nLayers; l++ {
+						for i := range keyCache[l] { keyCache[l][i] = 0 }
+						for i := range valCache[l] { valCache[l][i] = 0 }
+					}
+				}
+
+				fwd = func(tokenID, pos int) []float32 {
+					tokOff := tokenID * dim
+					if tokOff+dim > len(embedData) { return nil }
+					copy(mHidden, embedData[tokOff:tokOff+dim])
+					cosSlice := cosTab[pos*halfHead : pos*halfHead+halfHead]
+					sinSlice := sinTab[pos*halfHead : pos*halfHead+halfHead]
+
+					for l := 0; l < nLayers; l++ {
+						metal.InferForwardA(mHidden, cosSlice, sinSlice, mQBuf, mKBuf, mVBuf, l)
+						copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], mKBuf)
+						copy(valCache[l][pos*kvDim:(pos+1)*kvDim], mVBuf)
+
+						for i := range mAttnOut { mAttnOut[i] = 0 }
+						for h := 0; h < heads; h++ {
+							qOff := h * headDim
+							kvOff := (h / kvMulConst) * headDim
+							scores := att[h*(pos+1) : h*(pos+1)+(pos+1)]
+							for t := 0; t <= pos; t++ {
+								var dot float64
+								for j := 0; j < headDim; j++ {
+									dot += float64(mQBuf[qOff+j]) * float64(keyCache[l][t*kvDim+kvOff+j])
+								}
+								scores[t] = float32(dot) * invSqrtHeadDim
+							}
+							softmax(scores, pos+1)
+							for t := 0; t <= pos; t++ {
+								w := scores[t]
+								for j := 0; j < headDim; j++ {
+									mAttnOut[qOff+j] += w * valCache[l][t*kvDim+kvOff+j]
+								}
+							}
+						}
+						metal.InferForwardB(mHidden, mAttnOut, l)
+					}
+					metal.InferLogits(mHidden, mLogits)
+					return mLogits
+				}
 			}
 		}
 	}
 
-	// Tier 2: GPU-resident with TensorEngine
 	if fwd == nil {
-		te := mongoose.AsTensorEngine(eng)
-		if te != nil {
-			// Use cmdInferGPU's tier 2 path — too much code to duplicate.
-			// Fall through to CPU for chat.
+		log.Fatal("[chat] no inference backend available")
+	}
+	if resetKV == nil {
+		resetKV = func() {}
+	}
+
+	stopTokens := discoverStopTokens(tok, cfg, path)
+
+	return &chatEngine{
+		fwd:        fwd,
+		resetKV:    resetKV,
+		tok:        tok,
+		cfg:        cfg,
+		embedData:  embedData,
+		stopTokens: stopTokens,
+		maxSeq:     maxSeq,
+		modelName:  filepath.Base(path),
+		engineName: eng.Name(),
+	}
+}
+
+// generate runs inference and sends the result on doneCh.
+func (ce *chatEngine) generate(history []chatMessage, doneCh chan<- chatGenDone) {
+	ce.resetKV()
+	tokens := applyChatTemplate(ce.tok, history, ce.cfg)
+	if len(tokens) >= ce.maxSeq-10 {
+		doneCh <- chatGenDone{response: "[context full]"}
+		return
+	}
+
+	var logits []float32
+	for i, tid := range tokens {
+		logits = ce.fwd(tid, i)
+	}
+	if logits == nil {
+		doneCh <- chatGenDone{response: "[inference error]"}
+		return
+	}
+
+	temp := float32(0.7)
+	topK := 40
+	maxTokens := 512
+	allTokens := make([]int, len(tokens))
+	copy(allTokens, tokens)
+	nGen := 0
+	t0 := time.Now()
+
+	var response strings.Builder
+
+	for step := 0; step < maxTokens; step++ {
+		nextToken := sampleTopK(logits, temp, topK)
+		allTokens = append(allTokens, nextToken)
+		nGen++
+
+		if ce.stopTokens[nextToken] {
+			break
+		}
+
+		text := ce.tok.Decode([]int{nextToken})
+		response.WriteString(text)
+
+		full := response.String()
+		if idx := findSpecialToken(full); idx >= 0 {
+			response.Reset()
+			response.WriteString(full[:idx])
+			break
+		}
+
+		pos := len(allTokens) - 1
+		if pos >= ce.maxSeq-1 {
+			break
+		}
+		logits = ce.fwd(allTokens[pos], pos)
+		if logits == nil {
+			break
 		}
 	}
 
-	// CPU fallback using infer.go's cmdInferImpl approach
-	if fwd == nil {
-		log.Printf("[chat] no GPU forward pass available — GPU inference required for chat")
-		os.Exit(1)
+	final := response.String()
+	if idx := findSpecialToken(final); idx >= 0 {
+		final = final[:idx]
 	}
 
-	// Chat REPL
-	modelBase := filepath.Base(path)
+	elapsed := time.Since(t0)
+	tokPerSec := float64(nGen) / elapsed.Seconds()
+	doneCh <- chatGenDone{
+		nTokens:   nGen,
+		tokPerSec: tokPerSec,
+		response:  strings.TrimSpace(final),
+	}
+}
 
-	fmt.Printf("ai chat — %s (%s)\n", modelBase, eng.Name())
+// findSpecialToken returns the index of the first <|...|> pattern in s, or -1.
+func findSpecialToken(s string) int {
+	i := 0
+	for i < len(s) {
+		start := strings.Index(s[i:], "<|")
+		if start < 0 {
+			return -1
+		}
+		start += i
+		end := strings.Index(s[start:], "|>")
+		if end < 0 {
+			return -1
+		}
+		return start
+	}
+	return -1
+}
+
+// --- Bubbletea TUI ---
+
+type chatGenDone struct {
+	nTokens   int
+	tokPerSec float64
+	response  string
+}
+
+type doneMsg chatGenDone
+
+var (
+	headerStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	userStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
+	assistStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	promptStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	statusStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+)
+
+type chatModel struct {
+	engine     *chatEngine
+	history    []chatMessage
+	input      string
+	generating bool
+	stats      string
+	messages   []renderedMsg
+	doneCh     chan chatGenDone
+	width      int
+	height     int
+	quitting   bool
+}
+
+type renderedMsg struct {
+	role    string
+	content string
+}
+
+func newChatModel(engine *chatEngine) chatModel {
+	return chatModel{
+		engine:  engine,
+		history: []chatMessage{{Role: "system", Content: "You are a helpful assistant."}},
+		doneCh:  make(chan chatGenDone, 1),
+		width:   80,
+		height:  24,
+	}
+}
+
+func (m chatModel) Init() tea.Cmd {
+	return tea.Batch(tea.WindowSize(), tea.SetWindowTitle("ai chat — "+m.engine.modelName))
+}
+
+func waitForDone(ch <-chan chatGenDone) tea.Cmd {
+	return func() tea.Msg {
+		d := <-ch
+		return doneMsg(d)
+	}
+}
+
+func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+
+	case tea.KeyMsg:
+		if m.generating {
+			if msg.String() == "ctrl+c" {
+				m.quitting = true
+				return m, tea.Quit
+			}
+			return m, nil
+		}
+
+		switch msg.String() {
+		case "ctrl+c", "ctrl+d":
+			m.quitting = true
+			return m, tea.Quit
+		case "enter":
+			input := strings.TrimSpace(m.input)
+			if input == "" {
+				return m, nil
+			}
+			if input == "/clear" {
+				m.history = m.history[:1]
+				m.messages = nil
+				m.input = ""
+				m.stats = ""
+				return m, nil
+			}
+
+			m.messages = append(m.messages, renderedMsg{role: "user", content: input})
+			m.history = append(m.history, chatMessage{Role: "user", Content: input})
+			m.input = ""
+			m.generating = true
+			m.stats = ""
+
+			m.doneCh = make(chan chatGenDone, 1)
+			go m.engine.generate(m.history, m.doneCh)
+			return m, waitForDone(m.doneCh)
+
+		case "backspace":
+			if len(m.input) > 0 {
+				m.input = m.input[:len(m.input)-1]
+			}
+		default:
+			if len(msg.String()) == 1 || msg.String() == " " {
+				m.input += msg.String()
+			}
+		}
+		return m, nil
+
+	case doneMsg:
+		if msg.response != "" {
+			m.messages = append(m.messages, renderedMsg{role: "assistant", content: msg.response})
+			m.history = append(m.history, chatMessage{Role: "assistant", Content: msg.response})
+		}
+		m.generating = false
+		if msg.nTokens > 0 {
+			m.stats = fmt.Sprintf("%d tokens  %.1f tok/s", msg.nTokens, msg.tokPerSec)
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m chatModel) View() string {
+	if m.quitting {
+		return ""
+	}
+
+	var b strings.Builder
+
+	header := headerStyle.Render(fmt.Sprintf(" ai chat  %s  %s ", m.engine.modelName, m.engine.engineName))
+	b.WriteString(header)
+	b.WriteString("\n\n")
+
+	for _, msg := range m.messages {
+		switch msg.role {
+		case "user":
+			b.WriteString(userStyle.Render("You: "))
+			b.WriteString(msg.content)
+			b.WriteString("\n\n")
+		case "assistant":
+			b.WriteString(assistStyle.Render(msg.content))
+			b.WriteString("\n\n")
+		}
+	}
+
+	if m.generating {
+		b.WriteString(dimStyle.Render("thinking..."))
+		b.WriteString("\n\n")
+	}
+
+	if m.stats != "" {
+		b.WriteString(dimStyle.Render(m.stats))
+		b.WriteString("\n\n")
+	}
+
+	if !m.generating {
+		b.WriteString(promptStyle.Render("> "))
+		b.WriteString(m.input)
+		b.WriteString(dimStyle.Render("_"))
+	}
+
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render("  ctrl+c quit  /clear reset"))
+
+	return b.String()
+}
+
+func cmdChat(modelArg string) {
+	debug := GlobalVerbose
+
+	if !debug {
+		restore := suppressOutput()
+		defer restore()
+	}
+
+	ce := buildChatEngine(modelArg)
+
+	if debug {
+		cmdChatDebug(ce)
+		return
+	}
+
+	p := tea.NewProgram(newChatModel(ce), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// cmdChatDebug is the raw debug path — shows every token including specials.
+func cmdChatDebug(ce *chatEngine) {
+	fmt.Printf("ai chat [debug] — %s (%s)\n", ce.modelName, ce.engineName)
 	fmt.Printf("Type your message. Press Ctrl+D to exit.\n\n")
-
-	// Resolve stop token IDs once
-	stopTokens := map[int]bool{0: true}
-	if tok.EOS > 0 {
-		stopTokens[tok.EOS] = true
-	}
-	for _, s := range []string{"<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>"} {
-		if tok.HasToken(s) {
-			stopTokens[tok.Vocab[s]] = true
-		}
-		ids := tok.Encode(s)
-		if len(ids) == 1 {
-			stopTokens[ids[0]] = true
-		}
-	}
 
 	history := []chatMessage{
 		{Role: "system", Content: "You are a helpful assistant."},
 	}
 
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-
+	scanner := make([]byte, 0, 4096)
+	buf := make([]byte, 1)
 	for {
 		fmt.Print("> ")
-		if !scanner.Scan() {
-			fmt.Println()
-			break
+		scanner = scanner[:0]
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
+				fmt.Println()
+				return
+			}
+			if buf[0] == '\n' {
+				break
+			}
+			scanner = append(scanner, buf[0])
 		}
-		input := strings.TrimSpace(scanner.Text())
+		input := strings.TrimSpace(string(scanner))
 		if input == "" {
 			continue
 		}
 		if input == "/exit" || input == "/quit" {
 			break
 		}
-		if input == "/clear" {
-			history = history[:1] // keep system message
-			fmt.Println("(conversation cleared)")
-			// TODO: reset KV cache
-			continue
-		}
 
 		history = append(history, chatMessage{Role: "user", Content: input})
 
-		tokens := applyChatTemplate(tok, history, cfg)
-		if len(tokens) >= maxSeq-10 {
-			fmt.Println("(context full — clearing history)")
-			history = history[:1]
-			history = append(history, chatMessage{Role: "user", Content: input})
-			tokens = applyChatTemplate(tok, history, cfg)
-		}
+		doneCh := make(chan chatGenDone, 1)
+		go ce.generate(history, doneCh)
 
-		// Prefill
-		var logits []float32
-		for i, tid := range tokens {
-			logits = fwd(tid, i)
-		}
-		if logits == nil {
-			fmt.Println("[error: forward pass returned nil]")
-			continue
-		}
-
-		// Generate
-		temp := float32(0.7)
-		topK := 40
-		maxTokens := 512
-		allTokens := make([]int, len(tokens))
-		copy(allTokens, tokens)
-		var genTokens []int
-		var response strings.Builder
-
-		lastPrint := 0
-		t0 := time.Now()
-		for step := 0; step < maxTokens; step++ {
-			nextToken := sampleTopK(logits, temp, topK)
-			allTokens = append(allTokens, nextToken)
-			genTokens = append(genTokens, nextToken)
-
-			if stopTokens[nextToken] {
-				break
-			}
-
-			if nextToken >= 151643 {
-				break
-			}
-			text := tok.Decode([]int{nextToken})
-			response.WriteString(text)
-			// Check accumulated response for spelled-out special tokens
-			r := response.String()
-			if idx := strings.Index(r, "<|im_end|>"); idx >= 0 {
-				fmt.Print(r[lastPrint:idx])
-				break
-			}
-			if idx := strings.Index(r, "<|endoftext|>"); idx >= 0 {
-				fmt.Print(r[lastPrint:idx])
-				break
-			}
-			if idx := strings.Index(r, "<|eot_id|>"); idx >= 0 {
-				fmt.Print(r[lastPrint:idx])
-				break
-			}
-			// Print up to a safe point (hold back last 15 chars in case a special token is forming)
-			safeLen := len(r) - 15
-			if safeLen > lastPrint {
-				fmt.Print(r[lastPrint:safeLen])
-				lastPrint = safeLen
-			}
-			response.WriteString(text)
-
-			pos := len(allTokens) - 1
-			if pos >= maxSeq-1 {
-				break
-			}
-			logits = fwd(allTokens[pos], pos)
-			if logits == nil {
-				break
-			}
-		}
-
-		// Flush any remaining buffered text
-		r := response.String()
-		if lastPrint < len(r) {
-			// Don't print past any special token
-			remaining := r[lastPrint:]
-			if idx := strings.Index(remaining, "<|"); idx >= 0 {
-				remaining = remaining[:idx]
-			}
-			fmt.Print(remaining)
-		}
-
-		elapsed := time.Since(t0)
-		nGen := len(genTokens)
-		fmt.Printf("\n\n[%d tokens, %.1f tok/s]\n\n", nGen, float64(nGen)/elapsed.Seconds())
-
-		// Strip special tokens from history
-		cleanResponse := r
-		for _, sp := range []string{"<|im_end|>", "<|endoftext|>", "<|eot_id|>"} {
-			if idx := strings.Index(cleanResponse, sp); idx >= 0 {
-				cleanResponse = cleanResponse[:idx]
-			}
-		}
-		history = append(history, chatMessage{Role: "assistant", Content: strings.TrimSpace(cleanResponse)})
+		d := <-doneCh
+		fmt.Print(d.response)
+		fmt.Printf("\n\n[%d tokens, %.1f tok/s]\n\n", d.nTokens, d.tokPerSec)
+		history = append(history, chatMessage{Role: "assistant", Content: d.response})
 	}
 }

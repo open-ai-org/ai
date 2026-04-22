@@ -29,7 +29,7 @@ func cmdTrainAny() {
 
 	fs.Parse(os.Args[2:])
 
-	if *dataPath == "" { log.Fatal("--data flag required: ai train --data <file>") }
+	if *dataPath == "" { log.Fatal("data required: ai train data=<file>") }
 
 	eng := selectEngine("auto")
 

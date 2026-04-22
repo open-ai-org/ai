@@ -32,13 +32,13 @@ func cmdFinetune() {
 		home, _ := os.UserHomeDir()
 		*modelPath = filepath.Join(home, ".ai", "models", "TinyLlama-1.1B-Chat-v1.0")
 	}
-	if *dataPath == "" { log.Fatal("--data flag required: ai train --data <file>") }
+	if *dataPath == "" { log.Fatal("data required: ai finetune model=<name> data=<file>") }
 
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
 	if te == nil { log.Fatal("TensorEngine not available") }
 	cuda, ok := eng.(*mongoose.CUDA)
-	if !ok { log.Fatal("finetune requires CUDA") }
+	if !ok { log.Fatalf("finetune requires CUDA (detected: %s). On Metal, use: ai train model=<name> data=<file>", eng.Name()) }
 
 	if !mongoose.LoadKernels() {
 		log.Fatal("CUDA kernels required")

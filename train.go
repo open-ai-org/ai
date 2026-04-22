@@ -37,7 +37,7 @@ func cmdTrain() {
 	fs.Parse(os.Args[2:])
 
 	if *dataPath == "" {
-		log.Fatal("--data flag required: ai train --data <file>")
+		log.Fatal("data required: ai train data=<file>")
 	}
 	if *saveDir == "" {
 		home, _ := os.UserHomeDir()
@@ -245,7 +245,7 @@ func cmdResume() {
 		if fs.NArg() > 1 {
 			*dataPath = fs.Arg(1)
 		} else {
-			log.Fatal("--data flag required: ai train --data <file>")
+			log.Fatal("data required: ai train data=<file>")
 		}
 	}
 

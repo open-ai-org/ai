@@ -229,12 +229,25 @@ type serveState struct {
 // -----------------------------------------------------------------------
 
 // cmdServe starts the OpenAI-compatible API server.
-func cmdServe() {
+func cmdServe(args map[string]string) {
 	host := "0.0.0.0"
 	port := "11434"
 	modelName := ""
 
-	// Parse flags
+	// key=value args: ai serve model=X host=0.0.0.0 port=8080
+	if v, ok := args["model"]; ok {
+		modelName = v
+	} else if v, ok := args["_0"]; ok && !strings.HasPrefix(v, "--") {
+		modelName = v
+	}
+	if v, ok := args["host"]; ok {
+		host = v
+	}
+	if v, ok := args["port"]; ok {
+		port = v
+	}
+
+	// Also support --flag syntax for backwards compat
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--host":
@@ -283,7 +296,7 @@ func cmdServe() {
 	addr := host + ":" + port
 	log.Printf("[serve] mongoose API server listening on %s", addr)
 	if modelName == "" {
-		log.Printf("[serve] no model pre-loaded. Use --model <name> or POST with model field.")
+		log.Printf("[serve] no model pre-loaded. Use: ai serve <model>")
 	}
 	log.Printf("[serve] endpoints: /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models, /health")
 
@@ -900,7 +913,7 @@ func (s *serveState) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"model_loaded": modelLoaded,
 		"model":        modelName,
 		"gpu":          hasGPU,
-		"version":      "ai v1.0.0",
+		"version":      "ai v1.1.0",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -939,7 +952,7 @@ func (s *serveState) ensureModel(requestedModel string) error {
 	// during model swap (queue them, don't drop them).
 
 	if current == "" {
-		return fmt.Errorf("model %q not loaded — start server with --model flag", requestedModel)
+		return fmt.Errorf("model %q not loaded — start server with: ai serve %s", requestedModel, requestedModel)
 	}
 
 	// For now, use whatever model is loaded

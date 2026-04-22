@@ -54,15 +54,22 @@ func cmdTrainMetal() {
 		}
 		var cfg map[string]interface{}
 		json.Unmarshal(cfgData, &cfg)
-		getInt := func(key string, def int) int {
-			if v, ok := cfg[key].(float64); ok { return int(v) }
-			return def
+		explicit := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+		cfgInt := func(flagName, cfgKey string, target *int) {
+			if explicit[flagName] {
+				return
+			}
+			if v, ok := cfg[cfgKey].(float64); ok {
+				*target = int(v)
+			}
 		}
-		*dimFlag = getInt("hidden_size", *dimFlag)
-		*layersFlag = getInt("num_hidden_layers", *layersFlag)
-		*headsFlag = getInt("num_attention_heads", *headsFlag)
-		*kvHeadsFlag = getInt("num_key_value_heads", *kvHeadsFlag)
-		*ffnDimFlag = getInt("intermediate_size", *ffnDimFlag)
+		cfgInt("dim", "hidden_size", dimFlag)
+		cfgInt("layers", "num_hidden_layers", layersFlag)
+		cfgInt("heads", "num_attention_heads", headsFlag)
+		cfgInt("kv-heads", "num_key_value_heads", kvHeadsFlag)
+		cfgInt("ffn-dim", "intermediate_size", ffnDimFlag)
 
 		stPath := filepath.Join(ckptDir, "model.safetensors")
 		resumeST, err = gguf.OpenSafeTensors(stPath)
@@ -72,7 +79,7 @@ func cmdTrainMetal() {
 		fmt.Printf("Resuming from %s (dim=%d layers=%d)\n", ckptDir, *dimFlag, *layersFlag)
 	}
 
-	if *dataPath == "" { log.Fatal("--data flag required: ai train --data <file>") }
+	if *dataPath == "" { log.Fatal("data required: ai train data=<file>") }
 
 	eng := selectEngine("metal")
 	mtl, ok := eng.(*mongoose.Metal)

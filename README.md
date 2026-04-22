@@ -6,8 +6,30 @@ Powered by the [mongoose](https://github.com/open-ai-org/mongoose) GPU compute e
 
 ## Install
 
+macOS (Metal — Apple Silicon):
+
 ```bash
 go install github.com/open-ai-org/ai@latest
+```
+
+Linux (CUDA — NVIDIA GPUs):
+
+```bash
+CGO_CFLAGS="-I/usr/local/cuda/include" \
+CGO_LDFLAGS="-L/usr/local/cuda/lib64" \
+go install github.com/open-ai-org/ai@latest
+```
+
+Any GPU via Vulkan (WebGPU — AMD, Intel, NVIDIA):
+
+```bash
+CGO_ENABLED=0 go install github.com/open-ai-org/ai@latest
+```
+
+CPU only:
+
+```bash
+CGO_ENABLED=0 go install github.com/open-ai-org/ai@latest
 ```
 
 Or build from source:
@@ -21,6 +43,12 @@ go build -o ai .
 ## Quick Start
 
 ```bash
+# Train from scratch
+ai train data=corpus.txt
+
+# Fine-tune a pretrained model
+ai train model=Qwen2.5-0.5B data=corpus.txt
+
 # Download a model
 ai pull Qwen/Qwen2.5-0.5B
 
@@ -36,22 +64,35 @@ ai serve Qwen2.5-0.5B
 
 ## Commands
 
+Commands use `key=value` for required args. `--flags` are advanced overrides for users who know what they want — everything has safe defaults.
+
 ### Training
+
 | Command | Description |
 |---------|-------------|
 | `ai train data=<file>` | Train from scratch |
-| `ai finetune model=<name> data=<file>` | Fine-tune pretrained model |
-| `ai resume` | Continue training from checkpoint |
+| `ai train model=<name> data=<file>` | Fine-tune a pretrained model |
+| `ai resume checkpoint=<dir> data=<file>` | Continue training from checkpoint |
+
+Auto-detects GPU: Metal on macOS, CUDA on Linux, Vulkan everywhere else.
+
+Advanced overrides (optional — defaults are opinionated):
+
+```bash
+ai train data="/data/*.txt" --dim 512 --layers 8 --steps 5000 --lr 3e-4
+```
 
 ### Evaluation & Inference
+
 | Command | Description |
 |---------|-------------|
-| `ai chat <model>` | Interactive chat |
+| `ai chat <model>` | Interactive chat (bubbletea TUI) |
 | `ai infer <model> "prompt"` | Generate text |
 | `ai eval model=<name> data=<file>` | Validation pass (loss + perplexity) |
 | `ai benchmark <model>` | Inference throughput and latency |
 
 ### Optimization
+
 | Command | Description |
 |---------|-------------|
 | `ai quantize <model> [q8\|q4\|f16]` | Reduce precision |
@@ -61,6 +102,7 @@ ai serve Qwen2.5-0.5B
 | `ai merge <base> <adapters>` | Merge LoRA into base model |
 
 ### Data
+
 | Command | Description |
 |---------|-------------|
 | `ai dataset inspect <file>` | Dataset statistics and recommendations |
@@ -68,6 +110,7 @@ ai serve Qwen2.5-0.5B
 | `ai dataset augment <file>` | Dedup, lowercase, repeat, shuffle |
 
 ### Tuning & Search
+
 | Command | Description |
 |---------|-------------|
 | `ai sweep data=<file> lr=1e-4,3e-4,6e-4` | Hyperparameter search |
@@ -75,11 +118,13 @@ ai serve Qwen2.5-0.5B
 | `ai profile` | Per-op GPU timing breakdown |
 
 ### Deployment
+
 | Command | Description |
 |---------|-------------|
 | `ai serve <model>` | OpenAI-compatible API server |
 
 ### Introspection
+
 | Command | Description |
 |---------|-------------|
 | `ai explain <model> "prompt"` | Token-level attribution |
@@ -89,6 +134,7 @@ ai serve Qwen2.5-0.5B
 | `ai gpus` | Detect and calibrate hardware |
 
 ### Models
+
 | Command | Description |
 |---------|-------------|
 | `ai pull <org/model>` | Download from HuggingFace |
@@ -112,6 +158,7 @@ step 500   loss 1.95   floor 1.29   365 steps/s
 |----------|-------|
 | RTX 5090 Q8 | 182 |
 | M4 Max | 54 |
+| M1 Pro | 25 |
 
 - Automatic quantization: Q8 for models <4B params, Q4 for 7B+
 - Metal 4 `matmul2d` TensorOp on macOS 26+
@@ -120,11 +167,12 @@ step 500   loss 1.95   floor 1.29   365 steps/s
 
 ## GPU Support
 
-| Backend | Hardware | Build |
-|---------|----------|-------|
-| Metal | Apple Silicon (M1+) | `go build` on macOS |
-| CUDA | NVIDIA GPUs | `go build` on Linux with CUDA toolkit |
-| CPU | Any | `CGO_ENABLED=0 go build` |
+| Backend | Hardware | Install |
+|---------|----------|---------|
+| Metal | Apple Silicon (M1+) | `go install` on macOS |
+| CUDA | NVIDIA GPUs | `CGO_CFLAGS/LDFLAGS` + `go install` on Linux |
+| Vulkan | Any GPU (AMD, Intel, NVIDIA) | `CGO_ENABLED=0 go install` (WebGPU) |
+| CPU | Any | `CGO_ENABLED=0 go install` |
 
 ## Dependencies
 
