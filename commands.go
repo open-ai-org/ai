@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -285,16 +286,32 @@ func cmdGPUs() {
 	fmt.Println("Detected compute backends:")
 	fmt.Println()
 
-	cuda := mongoose.NewCUDA()
-	if cuda != nil {
-		fmt.Printf("  CUDA: %s\n", cuda.Name())
+	var gpu mongoose.Engine
+
+	if runtime.GOOS == "darwin" {
+		if m := mongoose.NewMetal(); m != nil {
+			fmt.Printf("  Metal: %s\n", m.Name())
+			gpu = m
+		}
+	}
+	if c := mongoose.NewCUDA(); c != nil {
+		fmt.Printf("  CUDA:  %s\n", c.Name())
+		if gpu == nil {
+			gpu = c
+		}
+	}
+	if w := mongoose.NewWebGPU(); w != nil {
+		fmt.Printf("  Vulkan: %s\n", w.Name())
+		if gpu == nil {
+			gpu = w
+		}
 	}
 	cpu := &mongoose.CPU{}
-	fmt.Printf("  CPU:  %s (%.1f GFLOPS)\n", cpu.Name(), cpu.Benchmark())
+	fmt.Printf("  CPU:   %s (%.1f GFLOPS)\n", cpu.Name(), cpu.Benchmark())
 
-	if cuda != nil {
+	if gpu != nil {
 		fmt.Println("\nScheduler calibration:")
-		sched := mongoose.NewScheduler(cuda, cpu)
+		sched := mongoose.NewScheduler(gpu, cpu)
 		sched.CalibrateMatMul(4096, 4096, 1)
 		sched.CalibrateAll(mongoose.NormKey(4096), func(eng mongoose.Engine) {
 			x := make([]float32, 4096)
