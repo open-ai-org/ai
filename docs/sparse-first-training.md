@@ -122,6 +122,18 @@ Checkpoints are Llama-format safetensors (FP32 weights + config.json), loadable 
 
 Estimated memory footprint is computed before allocation and compared against 75% of reported VRAM. Models that would exceed budget are rejected before touching the GPU, preventing the page-thrash lockups that occur when Metal unified memory exceeds physical capacity under GPU pressure.
 
+### 4.5 Helix Dispatch: Multi-GPU Position Parallelism
+
+Traditional multi-GPU training (DDP) replicates the model, feeds different batches to each GPU, and all-reduces gradients after backward — synchronizing the full gradient tensor every step. This is dense by design: every parameter's gradient crosses the wire.
+
+Helix Dispatch inverts this. Instead of splitting batches, it splits sequence positions. GPU 0 computes even positions (0, 2, 4, ...), GPU 1 computes odd positions (1, 3, 5, ...). Both GPUs hold full read-only FP16 weight replicas and fire every GEMM simultaneously on their half of the rows. The only cross-GPU transfer per layer is the K,V all-gather for causal attention — each GPU needs all positions' keys and values to compute correct attention scores.
+
+Each GPU runs its own Helix DNA optimizer on its own FP32 master weights. The two strands see different gradient signals (different positions produce different dW contributions) and drift apart slightly each step. The conductor's shared hot-row mask — computed on CPU from the same token observations — couples the strands: both GPUs agree on which rows are active, which coupling strengths to apply, which rung coefficients to use. The strands reconverge through this shared signal without ever synchronizing gradients.
+
+The result: zero gradient all-reduce, zero weight synchronization during training, ~3MB of wire traffic per step at dim=4096 (K,V exchange + position scatter/gather). On dual H100 SXM with NVLink, Helix Dispatch achieves 21.7 steps/s at dim=4096 (1.2B parameters), 54% faster than PyTorch DDP (14.1 steps/s) on the same hardware.
+
+The approach scales to N GPUs: GPU g computes positions where `pos % N == g`. Each GPU does 1/N of the sequence-position work on every GEMM. The only constraint is that sequence length must be divisible by GPU count.
+
 ## 5. The Helix Immune System
 
 Loss-floor tracking with automatic rewind provides training stability without manual intervention. When loss improves, the system checkpoints sparse hot-row weights. When loss rebounds past a threshold, it restores the checkpoint and continues — analogous to DNA damage repair where the cell reverts to the last known-good state.
@@ -145,11 +157,21 @@ Byte-level transformer, 4 layers, seq_len=64, vocab=256, 100 training steps.
 | 2048 | 152M | 32 | 24 | 1.3x |
 | 4096 | 605M | 11 | 6 | 1.7x |
 
-**NVIDIA RTX 5090 (CUDA, FP32 AdamW + Helix DNA rung):**
+**NVIDIA RTX 5090 (single GPU, pure Helix optimizer, 1000 steps):**
 
-| dim | steps/s |
-|-----|---------|
-| 128 | 700 (resume) / 323 (cold) |
+| dim | params | steps/s |
+|-----|--------|---------|
+| 128 | 624K | 773 |
+| 512 | 9.6M | 455 |
+| 1024 | 38M | 191 |
+| 2048 | 152M | 74 |
+
+**Dual H100 SXM NVLink (Helix Dispatch, 2000 steps):**
+
+| dim | params | mongoose steps/s | DDP steps/s | speedup |
+|-----|--------|-----------------|------------:|--------:|
+| 2048 | 302M | 40.9 | 32.5 | 1.3x |
+| 4096 | 1209M | 21.7 | 14.1 | 1.54x |
 
 ### 6.2 Convergence
 
