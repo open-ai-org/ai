@@ -235,7 +235,7 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	loraMid := te.Zeros([]int{n, rank})
 	loraAdd := te.Zeros([]int{n, ffnDim}) // sized for largest output dim
 
-	// --- Activation buffers (single set, reused across layers) ---
+	// --- Activation buffers ---
 	hidden := te.Zeros([]int{n, dim})
 	tokGPU := te.Zeros([]int{n})
 	targetsGPU := te.Zeros([]int{n})
@@ -244,17 +244,15 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	gradGPU := te.Zeros([]int{n, vocabSize})
 	normedFinal := te.Zeros([]int{n, dim})
 	finalScales := te.Zeros([]int{n})
-	// lm_head frozen — no gradient buffer needed (saves 3.1GB for 14B)
 	dHidden := te.Zeros([]int{n, dim})
 	dScratch := te.Zeros([]int{n, dim})
 
-	xIn := te.Zeros([]int{n, dim})
+	// Per-layer forward activations (reused, single set)
 	normed := te.Zeros([]int{n, dim})
 	Q := te.Zeros([]int{n, dim})
 	K := te.Zeros([]int{n, kvDim})
 	V := te.Zeros([]int{n, kvDim})
 	attnOut := te.Zeros([]int{n, dim})
-	xMid := te.Zeros([]int{n, dim})
 	normed2 := te.Zeros([]int{n, dim})
 	gatePre := te.Zeros([]int{n, ffnDim})
 	upOut := te.Zeros([]int{n, ffnDim})
@@ -263,25 +261,26 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	rmsScale2 := te.Zeros([]int{n})
 	dx := te.Zeros([]int{n, dim})
 
-	// Gradient buffers (reused)
-	dQ := te.Zeros([]int{n, dim})
-	dK := te.Zeros([]int{n, kvDim})
-	dV := te.Zeros([]int{n, kvDim})
-	dAttnOut := te.Zeros([]int{n, dim})
-	dN1 := te.Zeros([]int{n, dim})
-	dN2 := te.Zeros([]int{n, dim})
-	dFfnMid := te.Zeros([]int{n, ffnDim})
-	dGate := te.Zeros([]int{n, ffnDim})
-	dUp := te.Zeros([]int{n, ffnDim})
+	// Saved hidden states at layer boundaries for sparse backprop (240MB for 14B)
+	savedHidden := make([]*mongoose.Tensor, nLayers)
+	savedMid := make([]*mongoose.Tensor, nLayers) // hidden after attention, before FFN
+	for i := range savedHidden {
+		savedHidden[i] = te.Zeros([]int{n, dim})
+		savedMid[i] = te.Zeros([]int{n, dim})
+	}
 
-	// LoRA gradient buffers — two sets for paired projections
+	// Sparse backprop: only LoRA gradients needed
+	// dHidden propagation through frozen base uses shared dequant buffer
+	// LoRA grads: two sets for paired projections
 	dLoraMid := te.Zeros([]int{n, rank})
-	dA1 := te.Zeros([]int{rank * ffnDim}) // pair slot 1
+	dA1 := te.Zeros([]int{rank * ffnDim})
 	dB1 := te.Zeros([]int{ffnDim * rank})
-	dA2 := te.Zeros([]int{rank * ffnDim}) // pair slot 2
+	dA2 := te.Zeros([]int{rank * ffnDim})
 	dB2 := te.Zeros([]int{ffnDim * rank})
 
-	// lm_head + embed frozen — LoRA adapters handle all trainable params
+	// Gradient buffers for dHidden propagation (reused)
+	dN1 := te.Zeros([]int{n, dim})
+	dN2 := te.Zeros([]int{n, dim})
 
 	hlx := helix.NewHelixOptimizer(float32(lr), 0.9, 0.95, 1e-8, 0.1)
 
@@ -396,7 +395,9 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 		for li := range lays {
 			l := &lays[li]
 
-			cuda.CopyInto(xIn, hidden)
+			// Save hidden at layer entry (for backward recomputation)
+			cuda.CopyInto(savedHidden[li], hidden)
+
 			zero(normed); zero(rmsScale1)
 			mongoose.KRMSNormOutSave(hidden.DevicePtr(), normed.DevicePtr(),
 				l.norm1.DevicePtr(), rmsScale1.DevicePtr(), n, dim)
@@ -415,7 +416,9 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 			loraForward(dx, attnOut, l.wo, l.lo, n, dim, dim)
 			te.AddInPlace(hidden, dx)
 
-			cuda.CopyInto(xMid, hidden)
+			// Save hidden after attention (for FFN backward recomputation)
+			cuda.CopyInto(savedMid[li], hidden)
+
 			zero(normed2); zero(rmsScale2)
 			mongoose.KRMSNormOutSave(hidden.DevicePtr(), normed2.DevicePtr(),
 				l.norm2.DevicePtr(), rmsScale2.DevicePtr(), n, dim)
@@ -449,8 +452,8 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 		}
 		stepLoss /= float32(n)
 
-		// === BACKWARD ===
-		// lm_head is frozen — skip dLmHead, just backprop through it
+		// === SPARSE BACKWARD (recompute activations from saved hidden) ===
+		// Only LoRA gradients computed. dHidden propagated through frozen base.
 		cuda.MatMulTInto(dHidden, gradGPU, lmHead, n, vocabSize, dim)
 
 		zero(dScratch)
@@ -458,7 +461,6 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 			finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
 		cuda.CopyInto(dHidden, dScratch)
 
-		// Helix rung for this step
 		hlx.Step(step, stepLoss, float32(lr))
 		r := hlx.CurrentRung()
 		skipPaired := true // TODO: debug KHelixDNAStep call convention for LoRA paired projections
@@ -466,72 +468,83 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 		for li := nLayers - 1; li >= 0; li-- {
 			l := &lays[li]
 
-			// FFN backward
-			cuda.DequantToFP32(l.down.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dFfnMid, dHidden, dequantBuf, n, dim, ffnDim)
+			// --- Recompute FFN activations from savedMid[li] ---
+			zero(normed2); zero(rmsScale2)
+			mongoose.KRMSNormOutSave(savedMid[li].DevicePtr(), normed2.DevicePtr(),
+				l.norm2.DevicePtr(), rmsScale2.DevicePtr(), n, dim)
+
+			loraForward(gatePre, normed2, l.gate, l.lgate, n, dim, ffnDim)
+			loraForward(upOut, normed2, l.up, l.lup, n, dim, ffnDim)
+			zero(ffnMid)
+			mongoose.KSiLUGateMul(gatePre.DevicePtr(), upOut.DevicePtr(), ffnMid.DevicePtr(), n*ffnDim)
+
+			// FFN LoRA backward: down projection
 			loraBackward(dHidden, ffnMid, l.ldown, dA1, dB1, n, ffnDim, dim)
 			loraStepAdam(&l.ldown, dA1, dB1, step)
 
-			zero(dGate); zero(dUp)
-			mongoose.KSiLUGateBackward(dFfnMid.DevicePtr(), gatePre.DevicePtr(),
-				upOut.DevicePtr(), dGate.DevicePtr(), dUp.DevicePtr(), n*ffnDim)
+			// dHidden through frozen FFN for propagation
+			cuda.DequantToFP32(l.down.q8, dequantBuf.DevicePtr())
+			cuda.MatMulTInto(dN2, dHidden, dequantBuf, n, dim, ffnDim)
+			// dN2 is now dFfnMid — but we only need it for gate/up LoRA grads, not full SiLU backward
 
-			cuda.DequantToFP32(l.gate.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dN2, dGate, dequantBuf, n, ffnDim, dim)
+			// gate↔up LoRA backward (input was normed2)
+			loraBackward(dN2, normed2, l.lgate, dA1, dB1, n, dim, ffnDim)
+			loraBackward(dN2, normed2, l.lup, dA2, dB2, n, dim, ffnDim)
+			if !skipPaired {
+				loraStepPaired(&l.lgate, &l.lup, dA1, dB1, dA2, dB2, r, 3.0/5.0, step)
+			} else {
+				loraStepAdam(&l.lgate, dA1, dB1, step)
+				loraStepAdam(&l.lup, dA2, dB2, step)
+			}
 
-			cuda.DequantToFP32(l.up.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dx, dUp, dequantBuf, n, ffnDim, dim)
-			te.AddInPlace(dN2, dx)
-
-			// gate↔up paired: compute both gradients, then paired step
-			loraBackward(dGate, normed2, l.lgate, dA1, dB1, n, dim, ffnDim)
-			loraBackward(dUp, normed2, l.lup, dA2, dB2, n, dim, ffnDim)
-			if !skipPaired { loraStepPaired(&l.lgate, &l.lup, dA1, dB1, dA2, dB2, r, 3.0/5.0, step) } else { loraStepAdam(&l.lgate, dA1, dB1, step); loraStepAdam(&l.lup, dA2, dB2, step) }
-
+			// Propagate dHidden through FFN RMSNorm
 			zero(dx)
-			mongoose.KRMSNormBackward(dN2.DevicePtr(), xMid.DevicePtr(),
+			mongoose.KRMSNormBackward(dHidden.DevicePtr(), savedMid[li].DevicePtr(),
 				l.norm2.DevicePtr(), rmsScale2.DevicePtr(), dx.DevicePtr(), n, dim)
-			te.AddInPlace(dHidden, dx)
+			cuda.CopyInto(dHidden, dx)
 
-			// Attention backward
-			cuda.DequantToFP32(l.wo.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dAttnOut, dHidden, dequantBuf, n, dim, dim)
+			// --- Recompute attention activations from savedHidden[li] ---
+			zero(normed); zero(rmsScale1)
+			mongoose.KRMSNormOutSave(savedHidden[li].DevicePtr(), normed.DevicePtr(),
+				l.norm1.DevicePtr(), rmsScale1.DevicePtr(), n, dim)
+
+			loraForward(Q, normed, l.wq, l.lq, n, dim, dim)
+			loraForward(K, normed, l.wk, l.lk, n, dim, kvDim)
+			loraForward(V, normed, l.wv, l.lv, n, dim, kvDim)
+			mongoose.KRoPE(Q.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
+			mongoose.KRoPE(K.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
+			zero(attnOut)
+			mongoose.KCausalAttentionGQA(Q.DevicePtr(), K.DevicePtr(), V.DevicePtr(), attnOut.DevicePtr(),
+				n, dim, kvDim, heads, kvHeads)
+
+			// wo LoRA backward
 			loraBackward(dHidden, attnOut, l.lo, dA1, dB1, n, dim, dim)
 			loraStepAdam(&l.lo, dA1, dB1, step)
 
-			zero(dQ); zero(dK); zero(dV)
-			mongoose.KCausalAttentionBackward(Q.DevicePtr(), K.DevicePtr(), V.DevicePtr(), dAttnOut.DevicePtr(),
-				dQ.DevicePtr(), dK.DevicePtr(), dV.DevicePtr(), n, dim, kvDim, heads, kvHeads)
+			// Propagate dHidden through attention for Q/K/V LoRA grads
+			cuda.DequantToFP32(l.wo.q8, dequantBuf.DevicePtr())
+			cuda.MatMulTInto(dN1, dHidden, dequantBuf, n, dim, dim)
+			// dN1 is now dAttnOut — use for Q/K/V LoRA grads
 
-			mongoose.KRoPEBackward(dQ.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
-			mongoose.KRoPEBackward(dK.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
+			// q↔k LoRA backward (input was normed)
+			loraBackward(dN1, normed, l.lq, dA1, dB1, n, dim, dim)
+			loraBackward(dN1, normed, l.lk, dA2, dB2, n, dim, kvDim)
+			if !skipPaired {
+				loraStepPaired(&l.lq, &l.lk, dA1, dB1, dA2, dB2, r, 2.0/5.0, step)
+			} else {
+				loraStepAdam(&l.lq, dA1, dB1, step)
+				loraStepAdam(&l.lk, dA2, dB2, step)
+			}
 
-			cuda.DequantToFP32(l.wq.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dN1, dQ, dequantBuf, n, dim, dim)
-
-			cuda.DequantToFP32(l.wk.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dx, dK, dequantBuf, n, kvDim, dim)
-			te.AddInPlace(dN1, dx)
-
-			cuda.DequantToFP32(l.wv.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dx, dV, dequantBuf, n, kvDim, dim)
-			te.AddInPlace(dN1, dx)
-
-			// q↔k paired: compute both gradients, then paired step
-			loraBackward(dQ, normed, l.lq, dA1, dB1, n, dim, dim)
-			loraBackward(dK, normed, l.lk, dA2, dB2, n, dim, kvDim)
-			if !skipPaired { loraStepPaired(&l.lq, &l.lk, dA1, dB1, dA2, dB2, r, 2.0/5.0, step) } else { loraStepAdam(&l.lq, dA1, dB1, step); loraStepAdam(&l.lk, dA2, dB2, step) }
-
-			loraBackward(dV, normed, l.lv, dA1, dB1, n, dim, kvDim)
+			loraBackward(dN1, normed, l.lv, dA1, dB1, n, dim, kvDim)
 			loraStepAdam(&l.lv, dA1, dB1, step)
 
+			// Propagate dHidden through attention RMSNorm
 			zero(dx)
-			mongoose.KRMSNormBackward(dN1.DevicePtr(), xIn.DevicePtr(),
+			mongoose.KRMSNormBackward(dHidden.DevicePtr(), savedHidden[li].DevicePtr(),
 				l.norm1.DevicePtr(), rmsScale1.DevicePtr(), dx.DevicePtr(), n, dim)
-			te.AddInPlace(dHidden, dx)
+			cuda.CopyInto(dHidden, dx)
 		}
-
-		// lm_head frozen — no optimizer step
 
 		if step <= 3 || step%logEvery == 0 {
 			elapsed := time.Since(t0)
