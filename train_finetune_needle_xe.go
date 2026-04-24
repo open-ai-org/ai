@@ -14,14 +14,6 @@ import (
 	"github.com/open-ai-org/tokenizer"
 )
 
-func calcMaxHot(rows, cols int) int {
-	n := int(math.Sqrt(float64(rows * cols)))
-	if n < 49 {
-		n = 49
-	}
-	return n
-}
-
 func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery int) {
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
@@ -35,8 +27,8 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 	if !mongoose.LoadKernels() {
 		log.Fatal("CUDA kernels required")
 	}
-	if !mongoose.NeedleSparseLoaded() {
-		log.Fatal("KNeedleSparse kernel not loaded")
+	if !mongoose.AdamWLoaded() {
+		log.Fatal("KAdamW kernel not loaded")
 	}
 	if !mongoose.SoftmaxCELoaded() {
 		log.Fatal("softmax+CE kernel not loaded")
@@ -102,13 +94,11 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 	log.Printf("[finetune] loading %s (%s precision)", modelPath, precision)
 
 	type weight struct {
-		q8       *mongoose.Int8Tensor
-		mom      *mongoose.Tensor
-		delta    *mongoose.Tensor
-		tracker  *mongoose.ProjectionTracker
-		rows     int
-		cols     int
-		nHot     int
+		q8   *mongoose.Int8Tensor
+		m    *mongoose.Tensor // AdamW first moment [rows*cols] FP32
+		v    *mongoose.Tensor // AdamW second moment [rows*cols] FP32
+		rows int
+		cols int
 	}
 
 	loadWeight := func(name string, rows, cols int) weight {
@@ -121,16 +111,10 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 			DataInt8: qt.DataInt8, Scales: qt.Scales, Shape: qt.Shape,
 			Rows: qt.Rows, Cols: qt.Cols,
 		})
-		nh := calcMaxHot(rows, cols)
-		mom := cuda.AllocFP16Tensor(nh, []int{nh})
-		delta := cuda.AllocFP16Tensor(nh, []int{nh})
-		mongoose.KZero(mom.DevicePtr(), nh*2)
-		mongoose.KZero(delta.DevicePtr(), nh*2)
-		return weight{
-			q8: q8, mom: mom, delta: delta,
-			tracker: mongoose.NewProjectionTracker(rows, cols, 10),
-			rows: rows, cols: cols, nHot: nh,
-		}
+		nElems := rows * cols
+		m := te.Zeros([]int{nElems})
+		v := te.Zeros([]int{nElems})
+		return weight{q8: q8, m: m, v: v, rows: rows, cols: cols}
 	}
 
 	embedData, err := ms.ReadTensorFloat32("model.embed_tokens.weight")
@@ -203,17 +187,12 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 		}
 	}
 
-	conductor := mongoose.NewConductor(vocabSize, 1)
-
-	// Shared dequant buffer for INT8 path (reused per projection)
+	// Shared dequant buffer (reused per projection)
 	maxElems := ffnDim * dim
 	if dim*dim > maxElems {
 		maxElems = dim * dim
 	}
-	var dequantBuf *mongoose.Tensor
-	if precision == "int8" {
-		dequantBuf = te.Zeros([]int{maxElems})
-	}
+	dequantBuf := te.Zeros([]int{maxElems})
 
 	hidden := te.Zeros([]int{n, dim})
 	tokGPU := te.Zeros([]int{n})
@@ -268,169 +247,35 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 	}
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	globalMaxHot := calcMaxHot(ffnDim, dim)
-	hotIdxGPU := te.Zeros([]int{globalMaxHot})
-	hotF := make([]float32, globalMaxHot)
-	observeBuf := make([]float32, n*ffnDim)
 
-	needleLR := float32(lr)
-
-	needleFwd := func(w *weight, out, input *mongoose.Tensor, step int, seqN, inDim, outDim int) {
-		// Observe input for column tracking
-		if step >= 1 {
-			inSize := seqN * inDim
-			if len(observeBuf) < inSize {
-				observeBuf = make([]float32, inSize)
-			}
-			cuda.DownloadSlice(input, 0, observeBuf[:inSize])
-			w.tracker.ObserveInput(observeBuf[:inSize], seqN, inDim)
-		}
-
+	fwd := func(w *weight, out, input *mongoose.Tensor, seqN, inDim, outDim int) {
 		cuda.DequantToFP32(w.q8, dequantBuf.DevicePtr())
-
-		if step > 1 {
-			hotPos := w.tracker.HotPositions(w.nHot)
-			nh := len(hotPos)
-			if nh > 0 {
-				for i := 0; i < nh; i++ {
-					hotF[i] = math.Float32frombits(uint32(hotPos[i]))
-				}
-				cuda.UploadInto(hotIdxGPU, hotF[:nh])
-
-				mongoose.KNeedleSparse(
-					w.q8.DataPtr, w.q8.ScalePtr, dequantBuf.DevicePtr(),
-					w.mom.DevicePtr(), w.delta.DevicePtr(), hotIdxGPU.DevicePtr(),
-					nil, 1.0, needleLR, 0.9, 0.1,
-					nh, w.cols)
-			}
-		}
-
 		cuda.MatMulTransposeBTInto(out, input, dequantBuf, seqN, inDim, outDim)
-
-		// Observe output for row tracking
-		if step >= 1 {
-			outSize := seqN * outDim
-			if len(observeBuf) < outSize {
-				observeBuf = make([]float32, outSize)
-			}
-			cuda.DownloadSlice(out, 0, observeBuf[:outSize])
-			w.tracker.ObserveOutput(observeBuf[:outSize], seqN, outDim)
-		}
 	}
 
 	xeName := "none"
 	if xe != nil {
 		xeName = xe.Name()
 	}
-	fmt.Println("ai finetune — needle + backward pass + sparse update")
+	fmt.Println("ai finetune — backward pass + AdamW")
 	fmt.Printf("  engine:     %s (xe: %s)\n", eng.Name(), xeName)
 	fmt.Printf("  model:      %s\n", modelPath)
 	fmt.Printf("  data:       %s (%d tokens)\n", dataPath, len(tokens))
 	fmt.Printf("  arch:       dim=%d heads=%d kv=%d layers=%d ffn=%d vocab=%d\n",
 		dim, heads, kvHeads, nLayers, ffnDim, vocabSize)
-	fmt.Printf("  precision:  %s\n", precision)
+	fmt.Printf("  precision:  %s (base INT8, optimizer FP32)\n", precision)
 	fmt.Printf("  training:   steps=%d lr=%.0e seq=%d\n", steps, lr, seqLen)
-	fmt.Printf("  needle:     KNeedleSparse, %d max hot positions, compacted FP16 mom/delta\n", globalMaxHot)
 	fmt.Println()
 
-	type sparseCheckpoint struct {
-		momData   map[string][]float32
-		deltaData map[string][]float32
-		loss      float32
-		step      int
-	}
-	var ckpt *sparseCheckpoint
 	bestFloor := float32(1e30)
-	immuneActive := false
-	floorContactStep := 0
-	floorWindow := 10
-	maxRecoveries := 20
-	recoveryCount := 0
 
-	fp32Scratch := te.Zeros([]int{globalMaxHot})
-
-	allWeights := func(li int) []struct {
-		name string
-		w    *weight
-	} {
-		l := &lays[li]
-		return []struct {
-			name string
-			w    *weight
-		}{
-			{"wq", &l.wq}, {"wk", &l.wk}, {"wv", &l.wv},
-			{"wo", &l.wo}, {"gate", &l.gate}, {"up", &l.up}, {"down", &l.down},
-		}
-	}
-
-	downloadFP16 := func(src *mongoose.Tensor, nElem int) []float32 {
-		mongoose.KFP16ToFP32(src.DevicePtr(), fp32Scratch.DevicePtr(), nElem)
-		cuda.Sync()
-		host := te.ToHost(fp32Scratch)
-		out := make([]float32, nElem)
-		copy(out, host[:nElem])
-		return out
-	}
-
-	uploadFP16 := func(dst *mongoose.Tensor, data []float32) {
-		cuda.UploadInto(fp32Scratch, data)
-		mongoose.KFP32ToFP16(fp32Scratch.DevicePtr(), dst.DevicePtr(), len(data))
-	}
-
-	saveCheckpoint := func(loss float32, step int) {
-		ckpt = &sparseCheckpoint{
-			momData:   make(map[string][]float32),
-			deltaData: make(map[string][]float32),
-			loss:      loss,
-			step:      step,
-		}
-		cuda.Sync()
-		for li := range lays {
-			for _, pw := range allWeights(li) {
-				key := fmt.Sprintf("%d.%s", li, pw.name)
-				w := pw.w
-				ckpt.momData[key] = downloadFP16(w.mom, w.nHot)
-				ckpt.deltaData[key] = downloadFP16(w.delta, w.nHot)
-			}
-		}
-	}
-
-	restoreCheckpoint := func() {
-		if ckpt == nil {
-			return
-		}
-		for li := range lays {
-			for _, pw := range allWeights(li) {
-				key := fmt.Sprintf("%d.%s", li, pw.name)
-				w := pw.w
-				if momF, ok := ckpt.momData[key]; ok {
-					uploadFP16(w.mom, momF)
-				}
-				if deltaF, ok := ckpt.deltaData[key]; ok {
-					uploadFP16(w.delta, deltaF)
-				}
-			}
-		}
-	}
-
-	gradUpdate := func(w *weight, dOut, activations *mongoose.Tensor, seqN, outDim, inDim int) {
+	adamWStep := func(w *weight, dOut, activations *mongoose.Tensor, step, seqN, outDim, inDim int) {
 		cuda.MatMulTransposeATInto(dW, dOut, activations, seqN, outDim, inDim)
-
-		hotPos := w.tracker.HotPositions(w.nHot)
-		nh := len(hotPos)
-		if nh == 0 {
-			return
-		}
-		for i := 0; i < nh; i++ {
-			hotF[i] = math.Float32frombits(uint32(hotPos[i]))
-		}
-		cuda.UploadInto(hotIdxGPU, hotF[:nh])
-
-		mongoose.KNeedleSparse(
-			w.q8.DataPtr, w.q8.ScalePtr, nil,
-			w.mom.DevicePtr(), w.delta.DevicePtr(), hotIdxGPU.DevicePtr(),
-			dW.DevicePtr(), 0, needleLR, 0.9, 0.1,
-			nh, w.cols)
+		cuda.DequantToFP32(w.q8, dequantBuf.DevicePtr())
+		mongoose.KAdamW(dequantBuf.DevicePtr(), dW.DevicePtr(),
+			w.m.DevicePtr(), w.v.DevicePtr(),
+			float32(lr), 0.1, step, outDim*inDim)
+		cuda.RequantToInt8(w.q8, dequantBuf.DevicePtr())
 	}
 
 	tokI32 := make([]int32, n)
@@ -453,8 +298,6 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 		cuda.UploadInto(tokGPU, tokF)
 		cuda.UploadInto(targetsGPU, targF)
 
-		conductor.Observe(tokI32)
-
 		zero(hidden)
 		mongoose.KEmbedGather2(hidden.DevicePtr(), embed.DevicePtr(), tokGPU.DevicePtr(), n, dim)
 
@@ -469,9 +312,9 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 				l.norm1.DevicePtr(), rmsScale1.DevicePtr(), n, dim)
 			cuda.CopyInto(savedRMS1[li], rmsScale1)
 
-			needleFwd(&l.wq, Q, normed, step, n, dim, dim)
-			needleFwd(&l.wk, K, normed, step, n, dim, kvDim)
-			needleFwd(&l.wv, V, normed, step, n, dim, kvDim)
+			fwd(&l.wq, Q, normed, n, dim, dim)
+			fwd(&l.wk, K, normed, n, dim, kvDim)
+			fwd(&l.wv, V, normed, n, dim, kvDim)
 			if l.bq != nil { mongoose.KAddInPlace(Q.DevicePtr(), l.bq.DevicePtr(), n*dim) }
 			if l.bk != nil { mongoose.KAddInPlace(K.DevicePtr(), l.bk.DevicePtr(), n*kvDim) }
 			if l.bv != nil { mongoose.KAddInPlace(V.DevicePtr(), l.bv.DevicePtr(), n*kvDim) }
@@ -483,7 +326,7 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 			mongoose.KCausalAttentionGQA(Q.DevicePtr(), K.DevicePtr(), V.DevicePtr(), attnOut.DevicePtr(),
 				n, dim, kvDim, heads, kvHeads)
 
-			needleFwd(&l.wo, dx, attnOut, step, n, dim, dim)
+			fwd(&l.wo, dx, attnOut, n, dim, dim)
 			te.AddInPlace(hidden, dx)
 
 			cuda.CopyInto(savedXMid[li], hidden)
@@ -494,13 +337,13 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 				l.norm2.DevicePtr(), rmsScale2.DevicePtr(), n, dim)
 			cuda.CopyInto(savedRMS2[li], rmsScale2)
 
-			needleFwd(&l.gate, gatePre, normed2, step, n, dim, ffnDim)
-			needleFwd(&l.up, upOut, normed2, step, n, dim, ffnDim)
+			fwd(&l.gate, gatePre, normed2, n, dim, ffnDim)
+			fwd(&l.up, upOut, normed2, n, dim, ffnDim)
 
 			zero(ffnMid)
 			mongoose.KSiLUGateMul(gatePre.DevicePtr(), upOut.DevicePtr(), ffnMid.DevicePtr(), n*ffnDim)
 
-			needleFwd(&l.down, dx, ffnMid, step, n, ffnDim, dim)
+			fwd(&l.down, dx, ffnMid, n, ffnDim, dim)
 			te.AddInPlace(hidden, dx)
 		}
 
@@ -549,7 +392,7 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 			mongoose.KSiLUGateMul(gatePre.DevicePtr(), upOut.DevicePtr(), ffnMid.DevicePtr(), n*ffnDim)
 
 			// FFN backward: dW_down = dHidden^T @ ffnMid, needle accumulates
-			gradUpdate(&l.down, dHidden, ffnMid, n, dim, ffnDim)
+			adamWStep(&l.down, dHidden, ffnMid, step, n, dim, ffnDim)
 
 			// dFfnMid = dHidden @ down^T  (down is [dim, ffnDim])
 			cuda.DequantToFP32(l.down.q8, dequantBuf.DevicePtr())
@@ -560,8 +403,8 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 				upOut.DevicePtr(), dGate.DevicePtr(), dUp.DevicePtr(), n*ffnDim)
 
 			// dW_gate, dW_up → needle accumulates
-			gradUpdate(&l.gate, dGate, normed2, n, ffnDim, dim)
-			gradUpdate(&l.up, dUp, normed2, n, ffnDim, dim)
+			adamWStep(&l.gate, dGate, normed2, step, n, ffnDim, dim)
+			adamWStep(&l.up, dUp, normed2, step, n, ffnDim, dim)
 
 			// dHidden through FFN: dNormed2 = dGate @ gate + dUp @ up
 			cuda.DequantToFP32(l.gate.q8, dequantBuf.DevicePtr())
@@ -598,7 +441,7 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 				n, dim, kvDim, heads, kvHeads)
 
 			// Attention backward: dW_wo = dHidden^T @ attnOut, needle accumulates
-			gradUpdate(&l.wo, dHidden, attnOut, n, dim, dim)
+			adamWStep(&l.wo, dHidden, attnOut, step, n, dim, dim)
 
 			// dAttnOut = dHidden @ wo^T
 			cuda.DequantToFP32(l.wo.q8, dequantBuf.DevicePtr())
@@ -614,9 +457,9 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 			mongoose.KRoPEBackward(dK.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
 
 			// dW for q/k/v → needle accumulates
-			gradUpdate(&l.wq, dQ, normed, n, dim, dim)
-			gradUpdate(&l.wk, dK, normed, n, kvDim, dim)
-			gradUpdate(&l.wv, dV, normed, n, kvDim, dim)
+			adamWStep(&l.wq, dQ, normed, step, n, dim, dim)
+			adamWStep(&l.wk, dK, normed, step, n, kvDim, dim)
+			adamWStep(&l.wv, dV, normed, step, n, kvDim, dim)
 
 			// dHidden through attention: dNormed1 = dQ @ wq + dK @ wk + dV @ wv
 			cuda.DequantToFP32(l.wq.q8, dequantBuf.DevicePtr())
@@ -635,58 +478,15 @@ func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery
 			mongoose.KAddInPlace(dHidden.DevicePtr(), dScratch2.DevicePtr(), dHidden.Size)
 		}
 
-		// === IMMUNE SYSTEM (helix pattern, momentum restore, floor-anchored checkpoint) ===
-
-		// Rolling checkpoint: save when loss is near the best floor (anchored, won't drift)
-		if !immuneActive && step > 1 && stepLoss > 0 && bestFloor < 1e20 {
-			if stepLoss < bestFloor*1.5 {
-				saveCheckpoint(stepLoss, step)
-			}
-		}
-
-		// Floor detection
 		if step > 1 && stepLoss > 0 && stepLoss < bestFloor {
 			bestFloor = stepLoss
-			saveCheckpoint(stepLoss, step)
-			if !immuneActive {
-				immuneActive = true
-				floorContactStep = step
-				recoveryCount = 0
-			}
-		}
-
-		// Immune monitoring: window-based judgment after floor contact
-		immuneSkip := false
-		if immuneActive && step-floorContactStep >= floorWindow {
-			rebound := stepLoss - bestFloor
-			threshold := bestFloor * 0.15
-
-			if rebound > threshold && recoveryCount < maxRecoveries && ckpt != nil {
-				restoreCheckpoint()
-				recoveryCount++
-				immuneActive = false
-				immuneSkip = true
-				elapsed := time.Since(t0)
-				fmt.Printf("step %5d/%d  loss=%.4f  lr=%.1e  %.0fs  (%.1f steps/s) [IMMUNE → floor %.4f rebound=%.3f]\n",
-					step, steps, stepLoss, lr, elapsed.Seconds(),
-					float64(step)/elapsed.Seconds(), bestFloor, rebound)
-			} else {
-				// Loss stayed near floor — accept current state
-				immuneActive = false
-				saveCheckpoint(stepLoss, step)
-			}
-		}
-
-		if immuneSkip {
-			continue
 		}
 
 		if step <= 3 || step%logEvery == 0 {
-			hot, dead, _ := conductor.Stats()
 			elapsed := time.Since(t0)
-			fmt.Printf("step %5d/%d  loss=%.4f  lr=%.1e  %.0fs  (%.1f steps/s)  vocab: %d hot, %d dead\n",
-				step, steps, stepLoss, lr, elapsed.Seconds(),
-				float64(step)/elapsed.Seconds(), hot, dead)
+			fmt.Printf("step %5d/%d  loss=%.4f  floor=%.4f  lr=%.1e  %.0fs  (%.1f steps/s)\n",
+				step, steps, stepLoss, bestFloor, lr, elapsed.Seconds(),
+				float64(step)/elapsed.Seconds())
 		}
 
 		if step%1000 == 0 || step == steps {
