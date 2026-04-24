@@ -586,7 +586,7 @@ func (s *serveState) loadModel(name string) error {
 
 	// Metal fused compute path
 	if metal, ok := s.eng.(*mongoose.Metal); ok {
-		ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq)
+		ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq, float64(ropeTheta), 1e-6)
 		if ret == 0 {
 			wi := 0
 			kvDim := s.kvHeads * headDim
@@ -782,7 +782,7 @@ func (s *serveState) loadModel(name string) error {
 					for i := range bv { vv[i] += bv[i] }
 				}
 
-				applyRoPE(q, kk[:kvDim], pos, headDim, 10000.0, heads, kvHeads)
+				applyRoPE(q, kk[:kvDim], pos, headDim, float32(ropeTheta), heads, kvHeads)
 
 				copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], kk[:kvDim])
 				copy(valCache[l][pos*kvDim:(pos+1)*kvDim], vv[:kvDim])

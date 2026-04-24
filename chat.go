@@ -298,7 +298,7 @@ func buildChatEngine(modelArg string) *chatEngine {
 
 	// Metal fused compute shaders
 	if metal, ok := eng.(*mongoose.Metal); ok {
-		ret := metal.BuildFused(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, maxSeq)
+		ret := metal.BuildFused(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, maxSeq, float64(ropeTheta), 1e-6)
 		if ret == 0 {
 			wi := 0
 			for l := 0; l < nLayers; l++ {

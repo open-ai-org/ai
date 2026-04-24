@@ -832,7 +832,7 @@ func cmdInferGPU(model string, promptParts []string) {
 	useFused := false
 
 	if metal, ok := eng.(*mongoose.Metal); ok {
-		ret := metal.BuildFused(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, maxSeq)
+		ret := metal.BuildFused(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, maxSeq, float64(ropeTheta), 1e-6)
 		if ret == 0 {
 			nw := metal.FusedNumWeights()
 			fmt.Printf("  Metal fused compute pipeline (%d weight slots)\n", nw)
