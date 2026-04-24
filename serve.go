@@ -772,6 +772,16 @@ func (s *serveState) loadModel(name string) error {
 				mv(kk[:kvDim], wk, buf, kvDim, dim)
 				mv(vv[:kvDim], wv, buf, kvDim, dim)
 
+				if bq, _, err := st.ReadTensorFloat32(prefix + "self_attn.q_proj.bias"); err == nil {
+					for i := range bq { q[i] += bq[i] }
+				}
+				if bk, _, err := st.ReadTensorFloat32(prefix + "self_attn.k_proj.bias"); err == nil {
+					for i := range bk { kk[i] += bk[i] }
+				}
+				if bv, _, err := st.ReadTensorFloat32(prefix + "self_attn.v_proj.bias"); err == nil {
+					for i := range bv { vv[i] += bv[i] }
+				}
+
 				applyRoPE(q, kk[:kvDim], pos, headDim, 10000.0, heads, kvHeads)
 
 				copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], kk[:kvDim])
