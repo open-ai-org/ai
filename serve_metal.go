@@ -30,8 +30,9 @@ type metalStreamingInference struct {
 	layersReady atomic.Int32 // how many layers have been loaded
 	allReady    atomic.Bool  // true once finalNorm + lmHead are also loaded
 
-	fHidden [][]float32 // per-slot hidden buffer
-	fLogits [][]float32 // per-slot logits buffer
+	fHidden   [][]float32 // per-slot hidden buffer
+	fLogits   [][]float32 // per-slot logits buffer
+	streamFwd *metalStreamingForward // ping-pong weight streaming (used before resident weights are loaded)
 }
 
 func buildMetalStreamingInference(s *serveState, st *gguf.SafeTensors, lmHeadData []float32) *metalStreamingInference {
@@ -69,7 +70,10 @@ func buildMetalStreamingInference(s *serveState, st *gguf.SafeTensors, lmHeadDat
 		mi.fLogits[i] = make([]float32, s.vocabSize)
 	}
 
-	// Stream weights in background — inference can start once allReady is true
+	// Try streaming forward (ping-pong weight buffers, 19x less VRAM)
+	mi.streamFwd = buildMetalStreamingForward(s, st, lmHeadData)
+
+	// Also load weights into resident buffers in background for fast path
 	go mi.loadWeights(st, lmHeadData)
 
 	log.Printf("[serve] Metal streaming inference — %d slots, loading weights in background", nSlots)
@@ -128,9 +132,14 @@ func (mi *metalStreamingInference) loadWeights(st *gguf.SafeTensors, lmHeadData 
 	log.Printf("[serve] all %d weights loaded — inference ready", wi)
 }
 
-// forward runs one token through all layers on the given slot.
-// Blocks until all weights are loaded if called during streaming load.
+// forward runs one token. Uses streaming (ping-pong) path while weights are
+// loading, switches to resident (monolithic command buffer) once all weights
+// are in VRAM.
 func (mi *metalStreamingInference) forward(slot int, tokenID, pos int) []float32 {
+	if !mi.allReady.Load() && mi.streamFwd != nil {
+		return mi.streamFwd.forward(tokenID, pos)
+	}
+
 	for !mi.allReady.Load() {
 		time.Sleep(time.Millisecond)
 	}
