@@ -444,12 +444,13 @@ func (s *serveState) loadModel(name string) error {
 			fLogits := make([]float32, s.vocabSize)
 			s.fwd = func(tokenID, pos int) []float32 {
 				tokOff := tokenID * s.dim
-				if tokOff+s.dim > len(s.embedData) { return nil }
+				if tokenID < 0 || tokOff+s.dim > len(s.embedData) { return nil }
 				copy(fHidden, s.embedData[tokOff:tokOff+s.dim])
 				metal.FusedStep(fHidden, s.cosTab[pos*s.halfHead:pos*s.halfHead+s.halfHead],
 					s.sinTab[pos*s.halfHead:pos*s.halfHead+s.halfHead], pos, fLogits)
 				return fLogits
 			}
+			s.resetKV = func() { metal.FusedResetKV() }
 			log.Printf("[serve] Metal fused inference ready (%d weights)", wi)
 		}
 	}
@@ -951,17 +952,61 @@ func (s *serveState) handleCompletions(w http.ResponseWriter, r *http.Request) {
 
 	promptTokens := tok.Encode(req.Prompt)
 
-	// TODO: Run text completion inference:
-	//   1. Tokenize prompt
-	//   2. Forward pass through transformer layers
-	//   3. Autoregressive generation until maxTokens or stop sequence
-	//   4. Decode tokens to text
-	//
-	// The forward pass is identical to chat completions — the difference is
-	// that legacy completions don't apply a chat template to the prompt.
+	s.inferMu.Lock()
+	defer s.inferMu.Unlock()
 
-	generated := "[mongoose] completion inference stub"
-	completionTokens := len(tok.Encode(generated))
+	s.mu.RLock()
+	fwd := s.fwd
+	resetKV := s.resetKV
+	cfg := s.cfg
+	s.mu.RUnlock()
+
+	temp := float32(0.7)
+	if req.Temperature != nil {
+		temp = float32(*req.Temperature)
+	}
+	topK := 40
+
+	if resetKV != nil {
+		resetKV()
+	}
+
+	var logits []float32
+	for i, tid := range promptTokens {
+		logits = fwd(tid, i)
+	}
+	if logits == nil {
+		writeError(w, http.StatusInternalServerError, "inference failed", "server_error")
+		return
+	}
+
+	stopTokens := discoverStopTokens(tok, cfg, s.modelDir)
+
+	allTokens := make([]int, len(promptTokens))
+	copy(allTokens, promptTokens)
+	var genTokens []int
+	for step := 0; step < maxTokens; step++ {
+		nextToken := sampleTopK(logits, temp, topK)
+		allTokens = append(allTokens, nextToken)
+		genTokens = append(genTokens, nextToken)
+		if stopTokens[nextToken] {
+			break
+		}
+		pos := len(allTokens) - 1
+		if pos >= s.maxSeq-1 {
+			break
+		}
+		logits = fwd(allTokens[pos], pos)
+		if logits == nil {
+			break
+		}
+	}
+
+	generated := tok.Decode(genTokens)
+	if idx := findSpecialToken(generated); idx >= 0 {
+		generated = generated[:idx]
+	}
+	completionTokens := len(genTokens)
 
 	if req.Stream {
 		// TODO: SSE streaming for legacy completions
