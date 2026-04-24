@@ -455,11 +455,8 @@ func cmdFinetuneHelix(modelPath, dataPath string, steps int, lr float64, rank in
 			finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
 		cuda.CopyInto(dHidden, dScratch)
 
-		// Helix: compute rung for this step
-		r, _, _, rewound := hlx.PrepareStep(step, stepLoss, float32(lr))
-		if rewound {
-			continue
-		}
+		// Helix: compute rung for DNA pairing (ignore immune — we manage GPU state)
+		r, _, _, _ := hlx.PrepareStep(step, stepLoss, float32(lr))
 
 		for li := nLayers - 1; li >= 0; li-- {
 			l := &lays[li]
@@ -629,7 +626,7 @@ func cmdFinetuneHelix(modelPath, dataPath string, steps int, lr float64, rank in
 				float64(step)/elapsed.Seconds())
 		}
 
-		if step%1000 == 0 || step == steps {
+		if step == steps {
 			cuda.Sync()
 			outDir := filepath.Join(filepath.Dir(modelPath), fmt.Sprintf("helix-step-%d", step))
 			os.MkdirAll(outDir, 0755)
