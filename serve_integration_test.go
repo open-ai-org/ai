@@ -16,7 +16,7 @@ func modelAvailable() bool {
 
 func serveOn(t *testing.T, port int) func() {
 	t.Helper()
-	state := &serveState{}
+	state := &serveState{noStream: true}
 	if err := state.loadModel("Qwen2.5-0.5B"); err != nil {
 		t.Fatalf("loadModel: %v", err)
 	}
@@ -209,5 +209,87 @@ func TestIntegrationNoRegression(t *testing.T) {
 	t.Logf("best: %.1f tok/s", bestTokPerSec)
 	if bestTokPerSec < 100 {
 		t.Errorf("regression: best %.1f tok/s below 100 tok/s minimum", bestTokPerSec)
+	}
+}
+
+func TestIntegrationCoherence(t *testing.T) {
+	if !modelAvailable() {
+		t.Skip("Qwen2.5-0.5B not downloaded")
+	}
+	cleanup := serveOn(t, 19205)
+	defer cleanup()
+
+	// Warm up — run two requests to ensure streaming finishes and resident path activates
+	resp := postJSON(t, "http://127.0.0.1:19205/v1/completions",
+		`{"model":"Qwen2.5-0.5B","prompt":"Hello","max_tokens":5}`)
+	resp.Body.Close()
+	resp = postJSON(t, "http://127.0.0.1:19205/v1/completions",
+		`{"model":"Qwen2.5-0.5B","prompt":"Hello","max_tokens":5}`)
+	resp.Body.Close()
+
+	// Test 1: continuation produces real language, not garbage
+	resp = postJSON(t, "http://127.0.0.1:19205/v1/completions",
+		`{"model":"Qwen2.5-0.5B","prompt":"Once upon a time in a small village, there lived a","max_tokens":40}`)
+	defer resp.Body.Close()
+	var cr CompletionResponse
+	json.NewDecoder(resp.Body).Decode(&cr)
+	if len(cr.Choices) == 0 {
+		t.Fatal("no choices")
+	}
+	text := cr.Choices[0].Text
+	words := strings.Fields(text)
+	if len(words) < 10 {
+		t.Errorf("too few words for 40 tokens: %d words: %q", len(words), text)
+	} else {
+		t.Logf("continuation OK (%d words): %q", len(words), text)
+	}
+
+	// Test 2: no degenerate repetition (same word repeated 10+ times in a row)
+	resp2 := postJSON(t, "http://127.0.0.1:19205/v1/completions",
+		`{"model":"Qwen2.5-0.5B","prompt":"The history of computing began with","max_tokens":80}`)
+	var cr2 CompletionResponse
+	json.NewDecoder(resp2.Body).Decode(&cr2)
+	resp2.Body.Close()
+	if len(cr2.Choices) == 0 {
+		t.Fatal("no choices")
+	}
+	text2 := cr2.Choices[0].Text
+	words2 := strings.Fields(text2)
+	if len(words2) < 10 {
+		t.Errorf("too few words (%d): %q", len(words2), text2)
+	}
+	streak := 1
+	for i := 1; i < len(words2); i++ {
+		if words2[i] == words2[i-1] {
+			streak++
+			if streak >= 10 {
+				t.Errorf("degenerate repetition: %q repeated %d times in: %q", words2[i], streak, text2)
+				break
+			}
+		} else {
+			streak = 1
+		}
+	}
+	if streak < 10 {
+		t.Logf("no-repeat OK (%d words): %q", len(words2), text2)
+	}
+
+	// Test 3: output contains real English words (not token soup / garbage unicode)
+	common := []string{"the", "a", "is", "of", "and", "in", "to", "it", "that", "was", "for", "on", "with", "as", "at", "by", "an", "be", "or", "not", "from", "this", "are", "but", "has", "have", "had", "its", "which", "one", "all", "can", "if", "will", "no", "do", "so", "my", "he", "she", "we", "you", "they", "his", "her", "our"}
+	commonSet := make(map[string]bool)
+	for _, w := range common {
+		commonSet[w] = true
+	}
+	realWords := 0
+	for _, w := range words2 {
+		if commonSet[strings.ToLower(strings.Trim(w, ".,!?;:'\"()-"))] {
+			realWords++
+		}
+	}
+	ratio := float64(realWords) / float64(len(words2))
+	if ratio < 0.1 && len(words2) > 10 {
+		t.Errorf("token soup: only %.0f%% common English words in %d words: %q", ratio*100, len(words2), text2)
+	} else {
+		t.Logf("vocabulary OK: %.0f%% common words in %d words", ratio*100, len(words2))
 	}
 }
